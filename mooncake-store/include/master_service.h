@@ -1199,7 +1199,7 @@ class MasterService {
     bool use_disk_replica_{false};
 
     // Segment management
-    SegmentManager segment_manager_;
+    mutable SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     AllocationStrategyType allocation_strategy_type_ =
