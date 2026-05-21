@@ -88,6 +88,7 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_SSD_WATERMARK_RATIO = 0.15;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
@@ -357,6 +358,7 @@ enum class AllocationStrategyType {
     RANDOM = 0,        // Pure random allocation
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
     CXL,               // CXL-specific allocation
+    HARD_PIN,          // SSD-aware: exclude SSD-full segments, block SSD eviction
 };
 
 /**

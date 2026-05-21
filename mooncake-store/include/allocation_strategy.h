@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -534,6 +535,60 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     }
 };
 
+class HardPinAllocationStrategy : public FreeRatioFirstAllocationStrategy {
+   public:
+    using SsdFreeRatioQuery = std::function<double(const std::string&)>;
+    double ssd_watermark_ratio_ = 0.15;  // SSD remaining below 15% → full
+
+    void SetSsdFreeRatioQuery(SsdFreeRatioQuery query) {
+        ssd_free_ratio_query_ = std::move(query);
+    }
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>()) override {
+        // Build set of segments whose SSD is below watermark
+        std::set<std::string> ssd_full_segments;
+        if (ssd_free_ratio_query_) {
+            auto names = allocator_manager.getNames();
+            for (const auto& name : names) {
+                if (ssd_free_ratio_query_(name) < ssd_watermark_ratio_) {
+                    ssd_full_segments.insert(name);
+                }
+            }
+        }
+
+        // Merge with caller-provided exclusions
+        std::set<std::string> combined_excluded = excluded_segments;
+        combined_excluded.insert(ssd_full_segments.begin(),
+                                 ssd_full_segments.end());
+
+        // Try allocation excluding SSD-full segments
+        auto result = FreeRatioFirstAllocationStrategy::Allocate(
+            allocator_manager, slice_length, replica_num,
+            preferred_segments, combined_excluded);
+
+        // Fallback: if all excluded, retry without SSD filter (availability first)
+        if (!result.has_value() && !ssd_full_segments.empty()) {
+            LOG(WARNING)
+                << "[HARD_PIN] All " << ssd_full_segments.size()
+                << " segments excluded due to SSD watermark. "
+                << "Falling back to allocation without SSD filter.";
+            result = FreeRatioFirstAllocationStrategy::Allocate(
+                allocator_manager, slice_length, replica_num,
+                preferred_segments, excluded_segments);
+        }
+        return result;
+    }
+
+   private:
+    SsdFreeRatioQuery ssd_free_ratio_query_;
+};
+
 class CxlAllocationStrategy : public AllocationStrategy {
    public:
     CxlAllocationStrategy() = default;
@@ -605,6 +660,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
+        case AllocationStrategyType::HARD_PIN:
+            return std::make_shared<HardPinAllocationStrategy>();
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }

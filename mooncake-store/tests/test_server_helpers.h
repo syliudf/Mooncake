@@ -119,6 +119,10 @@ class InProcMaster {
                 config.eviction_high_watermark_ratio.has_value()
                     ? config.eviction_high_watermark_ratio.value()
                     : DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+            wms_cfg.ssd_watermark_ratio =
+                config.ssd_watermark_ratio.has_value()
+                    ? config.ssd_watermark_ratio.value()
+                    : DEFAULT_SSD_WATERMARK_RATIO;
             wms_cfg.view_version = 0;
             // Use default client_live_ttl_sec to align with production defaults
             wms_cfg.enable_ha = false;

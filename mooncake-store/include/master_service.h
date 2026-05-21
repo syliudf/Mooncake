@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -945,6 +946,7 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    double ssd_watermark_ratio_ = 0.15;           // SSD free ratio watermark
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1200,6 +1202,11 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    AllocationStrategyType allocation_strategy_type_ =
+        AllocationStrategyType::RANDOM;
+
+    double GetSsdFreeRatioForSegment(const std::string& segment_name) const;
+    std::string LogSystemCapacityState() const;
 
     bool enable_snapshot_restore_ = false;
 

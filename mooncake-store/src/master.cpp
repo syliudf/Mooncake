@@ -82,6 +82,9 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction");
+DEFINE_double(ssd_watermark_ratio,
+              mooncake::DEFAULT_SSD_WATERMARK_RATIO,
+              "SSD free ratio watermark for hard_pin strategy (default 0.15)");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -289,6 +292,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("ssd_watermark_ratio",
+                             &master_config.ssd_watermark_ratio,
+                             FLAGS_ssd_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
@@ -532,6 +538,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("ssd_watermark_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ssd_watermark_ratio = FLAGS_ssd_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
@@ -874,6 +885,7 @@ int main(int argc, char* argv[]) {
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
+        << ", ssd_watermark_ratio=" << master_config.ssd_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
         << ", offload_on_evict=" << master_config.offload_on_evict

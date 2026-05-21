@@ -89,6 +89,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      ssd_watermark_ratio_(config.ssd_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
@@ -104,6 +105,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(
           CreateAllocationStrategy(config.allocation_strategy_type)),
+      allocation_strategy_type_(config.allocation_strategy_type),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -176,6 +178,22 @@ MasterService::MasterService(const MasterServiceConfig& config)
         if (offload_force_evict_) {
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
+        }
+    }
+
+    // HardPin strategy: inject SSD free-ratio query callback
+    if (config.allocation_strategy_type == AllocationStrategyType::HARD_PIN) {
+        auto hard_pin_strategy =
+            std::dynamic_pointer_cast<HardPinAllocationStrategy>(
+                allocation_strategy_);
+        if (hard_pin_strategy) {
+            hard_pin_strategy->ssd_watermark_ratio_ = ssd_watermark_ratio_;
+            hard_pin_strategy->SetSsdFreeRatioQuery(
+                [this](const std::string& segment_name) -> double {
+                    return GetSsdFreeRatioForSegment(segment_name);
+                });
+            LOG(INFO) << "HardPin allocation strategy enabled: SSD-aware "
+                         "segment selection and eviction protection active";
         }
     }
 
@@ -1326,12 +1344,36 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             [](const Replica& replica) { return replica.is_disk_replica(); });
         MasterMetricManager::instance().dec_file_cache_nums();
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
+        // Track SSD usage before erasing
+        int64_t evicted_size = 0;
+        metadata.VisitReplicas(
+            [&client_id, &evicted_size](const Replica& replica) {
+                if (replica.is_local_disk_replica() &&
+                    replica.get_descriptor()
+                            .get_local_disk_descriptor()
+                            .client_id == client_id) {
+                    evicted_size +=
+                        static_cast<int64_t>(replica.get_descriptor()
+                                                 .get_local_disk_descriptor()
+                                                 .object_size);
+                }
+            });
         metadata.EraseReplicas([&client_id](const Replica& replica) {
             return replica.is_local_disk_replica() &&
                    replica.get_descriptor()
                            .get_local_disk_descriptor()
                            .client_id == client_id;
         });
+        if (evicted_size > 0) {
+            ScopedLocalDiskSegmentAccess ld_access =
+                segment_manager_.getLocalDiskSegmentAccess();
+            auto& ld_segments = ld_access.getClientLocalDiskSegment();
+            auto ld_it = ld_segments.find(client_id);
+            if (ld_it != ld_segments.end()) {
+                MutexLocker locker(&ld_it->second->offloading_mutex_);
+                ld_it->second->ssd_used_bytes -= evicted_size;
+            }
+        }
     } else {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
@@ -1347,6 +1389,38 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
+    // HARD_PIN strategy: reject SSD eviction requests from clients
+    if (allocation_strategy_type_ == AllocationStrategyType::HARD_PIN &&
+        replica_type == ReplicaType::LOCAL_DISK) {
+        ScopedLocalDiskSegmentAccess ld_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        const auto& ld_segments = ld_access.getClientLocalDiskSegment();
+        auto ld_it = ld_segments.find(client_id);
+        std::string capacity_info;
+        if (ld_it != ld_segments.end()) {
+            MutexLocker locker(&ld_it->second->offloading_mutex_);
+            double pct =
+                (ld_it->second->ssd_total_capacity_bytes > 0)
+                    ? 100.0 *
+                          static_cast<double>(ld_it->second->ssd_used_bytes) /
+                          static_cast<double>(
+                              ld_it->second->ssd_total_capacity_bytes)
+                    : 0.0;
+            capacity_info = fmt::format(
+                "ssd={}/{} ({:.1f}%)", ld_it->second->ssd_used_bytes,
+                ld_it->second->ssd_total_capacity_bytes, pct);
+        }
+        LOG(WARNING) << "[HARD_PIN] SSD eviction rejected. client="
+                     << client_id << " keys=" << keys.size() << " "
+                     << capacity_info;
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.push_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
@@ -2173,6 +2247,53 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return {};
 }
 
+double MasterService::GetSsdFreeRatioForSegment(
+    const std::string& segment_name) const {
+    ScopedLocalDiskSegmentAccess access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    const auto& client_by_name = access.getClientByName();
+    auto it = client_by_name.find(segment_name);
+    if (it == client_by_name.end()) return 1.0;
+
+    const auto& segments = access.getClientLocalDiskSegment();
+    auto seg_it = segments.find(it->second);
+    if (seg_it == segments.end()) return 1.0;
+
+    auto& ld = seg_it->second;
+    MutexLocker locker(&ld->offloading_mutex_);
+    if (ld->ssd_total_capacity_bytes <= 0) return 1.0;
+    int64_t pending = 0;
+    for (const auto& [k, sz] : ld->offloading_objects) pending += sz;
+    int64_t used = ld->ssd_used_bytes + pending;
+    int64_t free_bytes = ld->ssd_total_capacity_bytes - used;
+    return static_cast<double>(free_bytes) /
+           static_cast<double>(ld->ssd_total_capacity_bytes);
+}
+
+std::string MasterService::LogSystemCapacityState() const {
+    std::ostringstream oss;
+    double mem_used_ratio =
+        MasterMetricManager::instance().get_global_mem_used_ratio();
+    oss << "mem_used=" << fmt::format("{:.1f}%", mem_used_ratio * 100.0);
+
+    ScopedLocalDiskSegmentAccess access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    const auto& segments = access.getClientLocalDiskSegment();
+    for (const auto& [client_id, ld] : segments) {
+        MutexLocker locker(&ld->offloading_mutex_);
+        double ssd_pct = (ld->ssd_total_capacity_bytes > 0)
+                             ? 100.0 * static_cast<double>(ld->ssd_used_bytes) /
+                                   static_cast<double>(
+                                       ld->ssd_total_capacity_bytes)
+                             : 0.0;
+        oss << " [client=" << client_id
+            << " ssd=" << ld->ssd_used_bytes << "/"
+            << ld->ssd_total_capacity_bytes
+            << fmt::format(" ({:.1f}%)", ssd_pct) << "]";
+    }
+    return oss.str();
+}
+
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
                                       int64_t ssd_total_capacity_bytes)
     -> tl::expected<void, ErrorCode> {
@@ -2238,6 +2359,19 @@ auto MasterService::NotifyOffloadSuccess(
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, key, replica);
+
+        // Track SSD usage for HARD_PIN strategy
+        if (res) {
+            ScopedLocalDiskSegmentAccess ld_access =
+                segment_manager_.getLocalDiskSegmentAccess();
+            auto& ld_segments = ld_access.getClientLocalDiskSegment();
+            auto ld_it = ld_segments.find(client_id);
+            if (ld_it != ld_segments.end()) {
+                MutexLocker locker(&ld_it->second->offloading_mutex_);
+                ld_it->second->ssd_used_bytes +=
+                    static_cast<int64_t>(metadata.data_size);
+            }
+        }
         if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id << ", key=" << key;
@@ -3598,6 +3732,31 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (!offload_on_evict_) {
             // Original behavior
             return metadata.size * evict_replicas(metadata);
+        }
+
+        // HARD_PIN strategy: if SSD is at watermark, skip eviction to
+        // protect data that would need to offload to the full SSD.
+        if (allocation_strategy_type_ == AllocationStrategyType::HARD_PIN) {
+            bool ssd_full = false;
+            metadata.VisitReplicas(
+                &Replica::fn_is_memory_replica,
+                [this, &ssd_full](const Replica& r) {
+                    if (ssd_full) return;
+                    const auto& names = r.get_segment_names();
+                    for (const auto& name : names) {
+                        if (name.has_value() &&
+                            GetSsdFreeRatioForSegment(name.value()) < ssd_watermark_ratio_) {
+                            ssd_full = true;
+                            break;
+                        }
+                    }
+                });
+            if (ssd_full && !has_local_disk_replica(metadata)) {
+                LOG(WARNING)
+                    << "[HARD_PIN] Memory eviction skipped: SSD at watermark. "
+                    << "key=" << key << " " << LogSystemCapacityState();
+                return 0;
+            }
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
