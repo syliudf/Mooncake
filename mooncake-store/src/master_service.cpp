@@ -1394,7 +1394,9 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
-    // HARD_PIN strategy: reject SSD eviction requests from clients
+    // HARD_PIN strategy: unconditionally reject LOCAL_DISK eviction.
+    // SSD data must never be lost. The allocation filter prevents writing
+    // to nodes whose SSD is at watermark, so SSD should never overflow.
     if (allocation_strategy_type_ == AllocationStrategyType::HARD_PIN &&
         replica_type == ReplicaType::LOCAL_DISK) {
         ScopedLocalDiskSegmentAccess ld_access =
@@ -2219,7 +2221,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
         local_disk_segment_it->second->enable_offloading = enable_offloading;
         if (enable_offloading) {
-            return std::move(local_disk_segment_it->second->offloading_objects);
+            // Return a copy so failed offloads remain in the map for retry.
+            return local_disk_segment_it->second->offloading_objects;
         }
         // Offloading is disabled: clear the pending queue to prevent
         // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
@@ -2270,9 +2273,16 @@ double MasterService::GetSsdFreeRatioForSegment(
     int64_t pending = 0;
     for (const auto& [k, sz] : ld->offloading_objects) pending += sz;
     int64_t used = ld->ssd_used_bytes + pending;
-    int64_t free_bytes = ld->ssd_total_capacity_bytes - used;
+    // Reserve DDR-sized space on SSD so all DDR data can always be offloaded.
+    int64_t ddr_total =
+        MasterMetricManager::instance().get_total_mem_capacity();
+    int64_t effective_capacity =
+        ld->ssd_total_capacity_bytes - ddr_total;
+    if (effective_capacity <= 0) return 0.0;
+    int64_t free_bytes = effective_capacity - used;
+    if (free_bytes < 0) free_bytes = 0;
     return static_cast<double>(free_bytes) /
-           static_cast<double>(ld->ssd_total_capacity_bytes);
+           static_cast<double>(effective_capacity);
 }
 
 std::string MasterService::LogSystemCapacityState() const {
@@ -2365,7 +2375,7 @@ auto MasterService::NotifyOffloadSuccess(
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, key, replica);
 
-        // Track SSD usage for HARD_PIN strategy
+        // Track SSD usage and clean up offloading_objects for HARD_PIN strategy
         if (res) {
             ScopedLocalDiskSegmentAccess ld_access =
                 segment_manager_.getLocalDiskSegmentAccess();
@@ -2375,6 +2385,7 @@ auto MasterService::NotifyOffloadSuccess(
                 MutexLocker locker(&ld_it->second->offloading_mutex_);
                 ld_it->second->ssd_used_bytes +=
                     static_cast<int64_t>(metadata.data_size);
+                ld_it->second->offloading_objects.erase(key);
             }
         }
         if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
