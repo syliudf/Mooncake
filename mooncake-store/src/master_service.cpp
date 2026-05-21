@@ -837,6 +837,10 @@ auto MasterService::AllocateAndInsertMetadata(
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
                     << ", error: " << allocation_result.error();
+            if (allocation_strategy_type_ == AllocationStrategyType::HARD_PIN) {
+                LOG(WARNING) << "[HARD_PIN] PutStart allocation failed. "
+                             << LogSystemCapacityState();
+            }
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -3730,13 +3734,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto try_evict_or_offload =
         [&, this](const std::string& key, ObjectMetadata& metadata,
                   MetadataShardAccessorRW& shard) -> uint64_t {
-        if (!offload_on_evict_) {
-            // Original behavior
-            return metadata.size * evict_replicas(metadata);
-        }
-
-        // HARD_PIN strategy: if SSD is at watermark, skip eviction to
-        // protect data that would need to offload to the full SSD.
+        // HARD_PIN: regardless of offload_on_evict mode, check SSD watermark
+        // before evicting. If SSD is full and no LOCAL_DISK replica exists,
+        // evicting would lose data.
         if (allocation_strategy_type_ == AllocationStrategyType::HARD_PIN) {
             bool ssd_full = false;
             metadata.VisitReplicas(
@@ -3758,6 +3758,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     << "key=" << key << " " << LogSystemCapacityState();
                 return 0;
             }
+        }
+
+        if (!offload_on_evict_) {
+            return metadata.size * evict_replicas(metadata);
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
