@@ -3745,28 +3745,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto try_evict_or_offload =
         [&, this](const std::string& key, ObjectMetadata& metadata,
                   MetadataShardAccessorRW& shard) -> uint64_t {
-        // HARD_PIN: regardless of offload_on_evict mode, check SSD watermark
-        // before evicting. If SSD is full and no LOCAL_DISK replica exists,
-        // evicting would lose data.
+        // HARD_PIN: never evict MEMORY without LOCAL_DISK, regardless of SSD
+        // state. The SSD watermark check belongs in allocation (PutStart), not
+        // eviction.
         if (allocation_strategy_type_ == AllocationStrategyType::HARD_PIN) {
-            bool ssd_full = false;
-            metadata.VisitReplicas(
-                &Replica::fn_is_memory_replica,
-                [this, &ssd_full](const Replica& r) {
-                    if (ssd_full) return;
-                    const auto& names = r.get_segment_names();
-                    for (const auto& name : names) {
-                        if (name.has_value() &&
-                            GetSsdFreeRatioForSegment(name.value()) < ssd_watermark_ratio_) {
-                            ssd_full = true;
-                            break;
-                        }
-                    }
-                });
-            if (ssd_full && !has_local_disk_replica(metadata)) {
-                LOG(WARNING)
-                    << "[HARD_PIN] Memory eviction skipped: SSD at watermark. "
-                    << "key=" << key << " " << LogSystemCapacityState();
+            if (!has_local_disk_replica(metadata)) {
+                VLOG(1) << "[HARD_PIN] Memory eviction skipped: no LOCAL_DISK "
+                           "replica. key="
+                        << key;
                 return 0;
             }
         }
