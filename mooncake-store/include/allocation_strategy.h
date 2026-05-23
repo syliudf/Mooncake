@@ -572,15 +572,15 @@ class HardPinAllocationStrategy : public FreeRatioFirstAllocationStrategy {
             allocator_manager, slice_length, replica_num,
             preferred_segments, combined_excluded);
 
-        // Fallback: if all excluded, retry without SSD filter (availability first)
+        // When all segments fail SSD watermark check, refuse allocation rather
+        // than falling back. A fallback would write data that cannot be
+        // offloaded (SSD has no room), triggering eviction protection and
+        // eventually deadlocking DDR.
         if (!result.has_value() && !ssd_full_segments.empty()) {
             LOG(WARNING)
                 << "[HARD_PIN] All " << ssd_full_segments.size()
                 << " segments excluded due to SSD watermark. "
-                << "Falling back to allocation without SSD filter.";
-            result = FreeRatioFirstAllocationStrategy::Allocate(
-                allocator_manager, slice_length, replica_num,
-                preferred_segments, excluded_segments);
+                << "Refusing allocation to guarantee data safety.";
         }
         return result;
     }
