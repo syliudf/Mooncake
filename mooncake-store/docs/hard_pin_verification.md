@@ -39,7 +39,7 @@ DDR=4GB, SSD=16GB, Key=4MB
 - **进程会等待退出**：脚本结束时打印 `>>> 按回车退出`，方便查看 Master 日志后再退出。
 - **offload 需要足够数据量**：实测发现 offload 在写入量较小时可能不触发，脚本已设计为写入足够多的数据（≥200MB）。
 - **每次插入间等 0.01s**：避免写入过快导致问题。
-- **Duplicate Key 警告**：运行 `ssd_full_reject` 时可能出现 `Duplicate key detected in BatchOffload` 警告，这是 mooncake offload 管线的已知问题，不影响 HardPin 验证结果。
+- **Duplicate Key 警告**：如果出现 `Duplicate key detected in BatchOffload` 警告，说明 offload 管线存在跨 bucket 重复提交问题（`GroupOffloadingKeysByBucket` 中 `ungrouped_offloading_objects_` 与当前 `offloading_objects` 的跨 bucket 去重缺失），已在 `hard-pin` 分支修复。正常情况下不应再出现此警告。
 
 ---
 
@@ -249,4 +249,4 @@ client_service.cpp:1211] Failed to start put operation for key=xxx due to insuff
 | `Memory eviction skipped: no LOCAL_DISK` | **正确**：驱逐保护生效 |
 | `SSD eviction rejected` | **正确**：SSD 副本受保护 |
 | `client_service.cpp:1211 ... NO_AVAILABLE_HANDLE` | **正确**：Client 端收到了水位拒绝 |
-| `Duplicate key detected in BatchOffload` | mooncake 已有问题，不影响 HardPin 验证 |
+| `Duplicate key detected in BatchOffload` | offload 管线跨 bucket 重复（已修复），正常情况下不应出现 |

@@ -1332,22 +1332,13 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         return tl::make_unexpected(write_bucket_result.error());
     }
-    if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket->keys, metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket->keys.size()
-                       << ", Bucket id: " << bucket_id;
-            return tl::make_unexpected(error_code);
-        }
-    }
 
-    // Commit to metadata maps under exclusive lock.
-    // Check for duplicate keys and rollback if any found.
+    // Phase 3: duplicate check BEFORE notifying master, so that
+    // complete_handler (NotifyOffloadSuccess) is never called for data
+    // that will be discarded.  This keeps ssd_used_bytes accurate and
+    // avoids phantom LOCAL_DISK replicas pointing to deleted files.
     {
         SharedMutexLocker lock(&mutex_);
-
-        // Pre-check for duplicates before modifying any state
         for (const auto& key : bucket->keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
                 LOG(WARNING)
@@ -1359,8 +1350,23 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
         }
+    }
 
-        // No duplicates found, safe to commit
+    // Phase 4: notify master of successful offload.
+    if (complete_handler != nullptr) {
+        auto error_code = complete_handler(bucket->keys, metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Complete handler failed: " << error_code
+                       << ", Key count: " << bucket->keys.size()
+                       << ", Bucket id: " << bucket_id;
+            return tl::make_unexpected(error_code);
+        }
+    }
+
+    // Phase 5: commit to metadata maps under exclusive lock.
+    {
+        SharedMutexLocker lock(&mutex_);
+
         total_size_ += bucket->data_size + bucket->meta_size;
         object_bucket_map_.reserve(object_bucket_map_.size() +
                                    bucket->keys.size());
@@ -1368,7 +1374,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             auto [it, inserted] = object_bucket_map_.insert(
                 {bucket->keys[i], std::move(metadatas[i])});
             if (!inserted) {
-                LOG(ERROR) << "Unexpected duplicate key after pre-check: "
+                LOG(ERROR) << "Unexpected duplicate key at commit: "
                            << bucket->keys[i] << ", bucket_id=" << bucket_id;
             }
         }
@@ -1878,6 +1884,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         return IsExist(key);
     };
 
+    // Track keys already assigned to a bucket in this call so that keys
+    // from ungrouped_offloading_objects_ don't land in a later bucket
+    // when they also appear in the current offloading_objects iterator.
+    std::unordered_set<std::string> assigned_keys;
+
     while (it != offloading_objects.cend()) {
         std::vector<std::string> bucket_keys;
         std::unordered_map<std::string, int64_t> bucket_objects;
@@ -1885,6 +1896,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
 
         if (!ungrouped_offloading_objects.empty()) {
             for (const auto& ungrouped_it : ungrouped_offloading_objects) {
+                if (!assigned_keys.insert(ungrouped_it.first).second) {
+                    continue;
+                }
                 bucket_data_size += ungrouped_it.second;
                 bucket_keys.push_back(ungrouped_it.first);
                 bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
@@ -1924,6 +1938,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                            << ", error=" << is_exist_result.error();
             }
             if (is_exist_result && is_exist_result.value()) {
+                ++it;
+                continue;
+            }
+
+            if (!assigned_keys.insert(it->first).second) {
                 ++it;
                 continue;
             }

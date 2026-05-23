@@ -248,7 +248,7 @@ def test_ssd_full_reject():
     written = 0
     rejected = 0
     batch_size = 100
-    batch_sleep = 0.1  # 每批后等 0.1s
+    batch_sleep = 5.0  # 每批后等 5s，让 offload 管线排空 pending
     report_interval = 500
     t0 = time.time()
 

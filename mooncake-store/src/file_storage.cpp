@@ -1,6 +1,7 @@
 #include "file_storage.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
@@ -375,6 +376,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
+    std::optional<ErrorCode> first_error;
+
     for (const auto& keys : buckets_keys) {
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         auto query_result = BatchQuerySegmentSlices(keys, batch_object);
@@ -471,10 +474,13 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 enable_offloading_ = false;
                 return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() != ErrorCode::INVALID_READ) {
-                return tl::make_unexpected(offload_res.error());
+            if (!first_error) {
+                first_error = offload_res.error();
             }
         }
+    }
+    if (first_error) {
+        return tl::make_unexpected(*first_error);
     }
     return {};
 }
