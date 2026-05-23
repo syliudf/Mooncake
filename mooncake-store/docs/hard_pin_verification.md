@@ -18,7 +18,7 @@ python verify_hard_pin.py --test <test_name>
 
 | test_name | 验证内容 |
 |-----------|---------|
-| `offload_only` | **基础测试**：仅验证 DDR→SSD offload 管线是否工作（应首先运行此测试） |
+| `offload_only` | **基础测试**：写入 400MB 数据，验证 DDR→SSD offload 管线是否工作（应首先运行此测试） |
 | `ssd_full_reject` | SSD 水位不足时拒绝写入（不 fallback） |
 | `eviction_protection` | 无 LOCAL_DISK 副本的 MEMORY 不被驱逐 |
 | `ssd_eviction_rejected` | SSD (LOCAL_DISK) 副本不能被驱逐 |
@@ -28,8 +28,9 @@ python verify_hard_pin.py --test <test_name>
 
 | 环境变量 | 作用 | 示例 |
 |---------|------|------|
-| `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | **SSD 容量上限**，Client 通过 heartbeat 上报给 Master，Master 用此值计算水位 | `1342177280` (1280MB) |
+| `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | **SSD 容量上限**，Client 通过 heartbeat 上报给 Master，Master 用此值计算水位 | `85899345920` (80GB) |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | SSD 数据存储目录 | `/tmp/mooncake_ssd_test` |
+| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | offload 心跳间隔（默认 10s，测试时建议设为 1） | `1` |
 
 HardPin 的水位计算公式：
 ```
@@ -37,24 +38,24 @@ effective_capacity = MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES - DDR总容量
 effective_free_ratio = effective_free / effective_capacity
 ```
 
-通过调小 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`，可以精确控制 SSD 水位触发时机，**无需挂载小容量文件系统**。
-
-示例：DDR=640MB, SSD=1280MB, watermark=0.15
-- effective_capacity = 1280 - 640 = 640MB
-- effective_free_ratio 触发点 = 15% → effective_free < 96MB 时拒绝
-- 即 SSD 已用 > 544MB 时拒绝新写入
+默认规模：DDR=20GB, SSD=80GB, Key=4MB
+- effective_capacity = 80GB - 20GB = 60GB
+- watermark=0.15 → effective_free < 9GB 时拒绝
+- 即 SSD 已用 > 51GB 时拒绝新写入
 
 ## 注意事项
 
 - **SSD 显示 infinity 的原因**：如果未设置 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`，默认为 2TB，表现为 "infinity"。脚本会检查此环境变量，未设置时报错退出。
 - **put() 不抛异常**：`store.put()` 返回整数状态码（0=成功, 非0=失败），不会抛异常。脚本已用返回码判断成功/失败。
 - **进程会等待退出**：脚本结束时打印 `>>> 按回车键退出`，方便查看 Master 日志后再退出。
+- **offload 需要足够数据量**：实测发现 offload 在写入量较小时可能不触发，脚本已设计为写入足够多的数据（≥400MB）。
+- **每次插入间等 0.01s**：避免写入过快导致问题。
 
 ---
 
 ## 验证 0：Offload 管线基础测试（应首先运行）
 
-这是最基本的测试：写入 1MB 数据，等待 30 秒，验证 offload 管线工作。
+这是最基本的测试：写入 400MB 数据（100 个 4MB key），等待 30 秒，验证 offload 管线工作。
 如果此测试失败，说明 DDR→SSD offload 管线本身有问题，后续测试都会失败。
 
 ```bash
@@ -74,9 +75,9 @@ mooncake_master \
 MASTER_PID=$!
 sleep 2
 
-# SSD=1280MB, DDR=640MB → effective=640MB (足够大不会触发水位)
+# SSD=80GB, DDR=20GB → effective=60GB (足够大不会触发水位)
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=1342177280 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=85899345920 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test offload_only
@@ -87,9 +88,9 @@ rm -rf $TEST_DIR
 
 ### 预期观察
 
-- 写入 1MB 后等待 30 秒
-- SSD 路径出现文件
-- key 仍可读取（从 SSD 读回）
+- 写入 100 个 4MB key（400MB）后等待 30 秒
+- SSD 路径出现文件，metrics 中 SSD used > 0
+- 随机 key 仍可读取（从 SSD 读回）
 - Master 日志中可观察到 heartbeat 处理
 
 ### 如果失败
@@ -98,22 +99,22 @@ rm -rf $TEST_DIR
 - 检查 `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` 是否设为 1
 - 检查 SSD 路径是否有写权限
 - 检查 `--enable_offload=true` 是否设置
+- 检查写入量是否足够（可能需要更多数据触发 offload）
 
 ---
 
 ## 验证 1：SSD 全满时拒绝写入（不 fallback）
 
-场景设置：SSD=1280MB, DDR=640MB → effective_capacity=640MB, 水位线=15% (96MB)
-写入 3 个 4MB 后等待 15 秒让 offload 排空 DDR（验证 offload 在工作）
-然后分批继续写入，每批 2 个 4MB，批间等 15 秒
-约 136 个对象（544MB）后 effective_free < 96MB，SSD 水位触发拒绝。
+场景设置：SSD=80GB, DDR=20GB → effective_capacity=60GB, 水位线=15% (9GB)
+阶段 1：写入 100 个 4MB（400MB），等 30s 验证 offload 正常
+阶段 2：分批持续写入，每批 100 个，批间等 10s 让 offload 排空 DDR
+约 13000 个 key（约 51GB）后 effective_free < 9GB，SSD 水位触发拒绝。
 拒绝时 DDR 应远未满（offload 持续排空），确认是 SSD 水位而非 DDR 满。
 
 ```bash
 TEST_DIR="/tmp/mooncake_hardpin_test"
 rm -rf $TEST_DIR && mkdir -p $TEST_DIR
 
-# 启动 HardPin 模式的 Master（使用非默认端口避免冲突）
 mooncake_master \
     --port=50053 \
     --http_metadata_server_port=8880 \
@@ -128,9 +129,9 @@ mooncake_master \
 MASTER_PID=$!
 sleep 2
 
-# 运行验证脚本（SSD=2560MB, DDR=640MB → effective=1920MB）
+# SSD=80GB, DDR=20GB → effective=60GB
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=1342177280 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=85899345920 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_full_reject
@@ -147,8 +148,8 @@ rm -rf $TEST_DIR
 
 ### 预期观察
 
-- 阶段 1：写入 3 个 4MB 后等 15 秒，offload 排空 DDR，验证管线正常
-- 阶段 2：分批写入，每批 2 个后等 15 秒，约 68 批后 SSD 水位触发拒绝
+- 阶段 1：写入 100 个 4MB 后等 30s，offload 排空 DDR，验证管线正常
+- 阶段 2：分批写入，每批 100 个后等 10s，约 130 批后 SSD 水位触发拒绝
 - 首次拒绝时 DDR 占用应较低（offload 持续排空），确认是 SSD 水位
 - Master 日志：`[HARD_PIN] ... Refusing allocation to guarantee data safety.`
 - Client 日志：`Failed to start put operation ... NO_AVAILABLE_HANDLE`（`client_service.cpp:1211`，**预期行为**）
@@ -158,6 +159,8 @@ rm -rf $TEST_DIR
 ---
 
 ## 验证 2：驱逐保护（DDR 中无 LOCAL_DISK 副本的数据不被驱逐）
+
+此测试使用小 DDR（4MB）以便快速触发驱逐，不受默认 20GB 影响。
 
 ```bash
 TEST_DIR="/tmp/mooncake_hardpin_evict_test"
@@ -176,10 +179,10 @@ mooncake_master \
 MASTER_PID=$!
 sleep 2
 
-# SSD 容量 1280MB，DDR 4MB → effective 1276MB，足够大不触发水位
+# SSD=80GB, DDR=4MB（脚本内部覆盖为 4MB）
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 DEFAULT_KV_LEASE_TTL=500 \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=1342177280 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=85899345920 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test eviction_protection
@@ -217,7 +220,7 @@ MASTER_PID=$!
 sleep 2
 
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=1342177280 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=85899345920 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_eviction_rejected
@@ -253,10 +256,10 @@ mooncake_master \
 MASTER_PID=$!
 sleep 2
 
-# SSD=256MB, DDR=64MB → effective=192MB
+# SSD=80GB, DDR=20GB → effective=60GB
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 DEFAULT_KV_LEASE_TTL=2000 \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=1342177280 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=85899345920 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test full_lifecycle
@@ -268,8 +271,8 @@ rm -rf $TEST_DIR
 ### 预期观察
 
 1. `put("lifecycle_key", data)` → 成功（SSD 有空间）
-2. 等待 20 秒 offload 完成（heartbeat 驱动 DDR→SSD 传输）
-3. 等 lease 过期后压力写入 200 个对象（800MB > 640MB DDR）触发驱逐 → `lifecycle_key` 的 MEMORY 副本被驱逐（因为已有 LOCAL_DISK）
+2. 等待 30 秒 offload 完成（heartbeat 驱动 DDR→SSD 传输）
+3. 等 lease 过期后压力写入 5500 个 4MB key（22GB > 20GB DDR）触发驱逐 → `lifecycle_key` 的 MEMORY 副本被驱逐（因为已有 LOCAL_DISK）
 4. `get("lifecycle_key")` → 成功（从 SSD 读取）
 
 ---
@@ -314,7 +317,7 @@ mooncake_master \
 sleep 2
 
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=1342177280 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=85899345920 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_full_reject
