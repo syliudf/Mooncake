@@ -67,7 +67,6 @@ mooncake_master \
     --enable_offload=true \
     --ssd_watermark_ratio=0.15 \
     --default_kv_lease_ttl=2000 \
-    --root_fs_dir=$TEST_DIR \
     2>&1 | tee master.log &
 MASTER_PID=$!
 sleep 2
