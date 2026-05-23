@@ -48,8 +48,10 @@ effective_free_ratio = effective_free / effective_capacity
 
 ## 验证 1：SSD 全满时拒绝写入（不 fallback）
 
-场景设置：SSD=256MB, DDR=64MB → effective_capacity=192MB, 水位线=15% (28.8MB)
-写入 ~164MB 数据后 effective_free < 28.8MB，水位触发拒绝。
+场景设置：SSD=128MB, DDR=64MB → effective_capacity=64MB, 水位线=15% (9.6MB)
+分批写入：每批 4 个 4MB 对象，批间等 5 秒让 offload 排空 DDR（避免 DDR 满→驱逐风暴）
+约 14 个对象（56MB）后 effective_free < 9.6MB，SSD 水位触发拒绝。
+拒绝时 DDR 仅占 ~8MB / 64MB = 12.5%，确认是 SSD 水位而非 DDR 满。
 
 ```bash
 TEST_DIR="/tmp/mooncake_hardpin_test"
@@ -69,9 +71,9 @@ mooncake_master \
 MASTER_PID=$!
 sleep 2
 
-# 运行验证脚本
+# 运行验证脚本（SSD=128MB, DDR=64MB）
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=268435456 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=134217728 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_full_reject
 
@@ -87,10 +89,12 @@ rm -rf $TEST_DIR
 
 ### 预期观察
 
-- 脚本输出：前若干个写入成功，之后持续被拒绝
-- Master 日志中出现 `[HARD_PIN] ... Refusing allocation to guarantee data safety.`
-- Client 日志（stderr）出现 `Failed to start put operation ... NO_AVAILABLE_HANDLE`（这就是 `client_service.cpp:1211`，是**预期的正确行为**）
+- 脚本分批写入，每批后等 5 秒，约 4 批后 SSD 水位触发拒绝
+- 首次拒绝时 DDR 占用 ~12%，确认不是 DDR 满而是 SSD 水位
+- Master 日志：`[HARD_PIN] ... Refusing allocation to guarantee data safety.`
+- Client 日志：`Failed to start put operation ... NO_AVAILABLE_HANDLE`（`client_service.cpp:1211`，**预期行为**）
 - **不应出现** `Falling back to allocation without SSD filter`
+- **不应出现** 大量 `EVICT-TRIGGER` 日志（因为 DDR 不满）
 
 ---
 
@@ -244,7 +248,7 @@ mooncake_master \
 sleep 2
 
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=268435456 \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=134217728 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_full_reject
 
