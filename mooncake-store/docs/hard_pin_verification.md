@@ -72,10 +72,9 @@ MASTER_PID=$!
 sleep 2
 
 # 运行验证脚本（SSD=128MB, DDR=64MB）
-TEST_DIR="/tmp/mooncake_hardpin_test"
-MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=134217728 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_full_reject
 
@@ -114,7 +113,6 @@ mooncake_master \
     --allocation_strategy=hard_pin \
     --enable_offload=true \
     --default_kv_lease_ttl=500 \
-    --root_fs_dir=$TEST_DIR \
     2>&1 | tee master_evict.log &
 MASTER_PID=$!
 sleep 2
@@ -123,6 +121,7 @@ sleep 2
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 DEFAULT_KV_LEASE_TTL=500 \
 MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=268435456 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test eviction_protection
 
@@ -153,13 +152,13 @@ mooncake_master \
     --allocation_strategy=hard_pin \
     --enable_offload=true \
     --default_kv_lease_ttl=2000 \
-    --root_fs_dir=$TEST_DIR \
     2>&1 | tee master_ssd.log &
 MASTER_PID=$!
 sleep 2
 
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=268435456 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_eviction_rejected
 
@@ -189,7 +188,6 @@ mooncake_master \
     --allocation_strategy=hard_pin \
     --enable_offload=true \
     --default_kv_lease_ttl=2000 \
-    --root_fs_dir=$TEST_DIR \
     2>&1 | tee master_lifecycle.log &
 MASTER_PID=$!
 sleep 2
@@ -198,6 +196,7 @@ sleep 2
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 DEFAULT_KV_LEASE_TTL=2000 \
 MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=268435456 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_DIR \
 python mooncake-wheel/tests/verify_hard_pin.py --test full_lifecycle
 
@@ -247,7 +246,6 @@ mooncake_master \
     --allocation_strategy=hard_pin \
     --enable_offload=true \
     --ssd_watermark_ratio=0.15 \
-    --root_fs_dir=$TEST_DIR \
     --default_kv_lease_ttl=2000 \
     2>&1 | tee master.log &
 

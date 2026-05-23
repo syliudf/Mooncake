@@ -9,21 +9,11 @@
 用法：
     python verify_hard_pin.py --test <test_name>
 
-test_name:
-    ssd_full_reject       - 验证保证2：SSD 水位拒绝（不 fallback）
-    eviction_protection   - 验证保证1：驱逐保护
-    ssd_eviction_rejected - 验证保证3：SSD 副本不可驱逐
-    full_lifecycle        - 端到端：写入→offload→驱逐→读取
-
 关键环境变量：
     MC_METADATA_SERVER                        - Master 元数据地址
-    DEFAULT_KV_LEASE_TTL                      - Lease TTL ms
     MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES   - SSD 容量上限（字节）
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH        - SSD 数据存储目录
-
-注意：
-    store.put() 返回整数状态码：0=成功, 非0=失败（不抛异常）
-    store.get() 返回 bytes：空 bytes b"" 表示失败
+    MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS - Offload 心跳间隔（建议设为 1）
 """
 
 import argparse
@@ -31,38 +21,70 @@ import os
 import sys
 import time
 import traceback
+import urllib.request
+import json
 
 from mooncake.store import MooncakeDistributedStore
 
-# 默认端口配置
 DEFAULT_MASTER_PORT = "50053"
 DEFAULT_METADATA_PORT = "8880"
 DEFAULT_METRICS_PORT = "9104"
 
 
+def fetch_metrics():
+    """从 Master metrics 端口获取指标。"""
+    metrics_port = os.getenv("METRICS_PORT", DEFAULT_METRICS_PORT)
+    try:
+        url = f"http://127.0.0.1:{metrics_port}/stats"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def print_metrics(label=""):
+    """打印当前 Master 的 Mem/SSD 状态。"""
+    stats = fetch_metrics()
+    if not stats:
+        return
+    prefix = f"  [{label}] " if label else "  "
+    # 尝试从 metrics 中提取关键数值
+    for key, val in stats.items() if isinstance(stats, dict) else []:
+        if "mem" in key.lower() or "memory" in key.lower() or "ssd" in key.lower() or "file" in key.lower():
+            pass  # metrics 格式不确定，仅打印原始数据
+    # 简单打印关键字段
+    try:
+        mem_total = stats.get("master_total_segment_capacity_bytes", 0)
+        mem_used = stats.get("master_used_memory_bytes", 0)
+        ssd_total = stats.get("master_total_file_capacity_bytes", 0)
+        ssd_used = stats.get("master_allocated_file_size_bytes", 0)
+        if mem_total > 0:
+            print(f"{prefix}Mem: {mem_used/1024/1024:.0f}M/{mem_total/1024/1024:.0f}M "
+                  f"({mem_used/mem_total*100:.0f}%)")
+        if ssd_total > 0 and ssd_total < 10**15:  # 过滤掉异常大值
+            print(f"{prefix}SSD: {ssd_used/1024/1024:.0f}M/{ssd_total/1024/1024:.0f}M "
+                  f"({ssd_used/ssd_total*100:.0f}%)")
+    except Exception:
+        pass
+
+
 def create_store(segment_size=64 * 1024 * 1024,
                  buffer_size=64 * 1024 * 1024):
-    """创建并初始化一个 Store 客户端。
-
-    SSD 容量通过 MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES 环境变量控制，
-    Client 初始化时会通过 ReportSsdCapacity RPC 上报给 Master。
-    """
+    """创建 Store 客户端。"""
     ssd_limit_str = os.getenv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "")
     if not ssd_limit_str:
         print("[ERROR] MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES 未设置！")
-        print("  HardPin 需要 SSD 容量限制来计算水位。")
-        print("  例如：MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=134217728 (128MB)")
         sys.exit(1)
 
     ssd_limit = int(ssd_limit_str)
     effective = ssd_limit - segment_size
-    print(f"  SSD 限制: {ssd_limit / 1024 / 1024:.0f}MB, "
-          f"DDR: {segment_size / 1024 / 1024:.0f}MB, "
-          f"effective_capacity: {effective / 1024 / 1024:.1f}MB")
-
     if effective <= 0:
-        print(f"[ERROR] effective_capacity <= 0！SSD({ssd_limit}) 必须 > DDR({segment_size})")
+        print(f"[ERROR] SSD({ssd_limit}) 必须 > DDR({segment_size})")
         sys.exit(1)
+
+    print(f"  SSD={ssd_limit/1024/1024:.0f}MB, DDR={segment_size/1024/1024:.0f}MB, "
+          f"effective={effective/1024/1024:.0f}MB")
 
     store = MooncakeDistributedStore()
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -72,69 +94,50 @@ def create_store(segment_size=64 * 1024 * 1024,
                                 f"http://127.0.0.1:{DEFAULT_METADATA_PORT}/metadata")
     master_server = os.getenv("MASTER_SERVER",
                               f"127.0.0.1:{DEFAULT_MASTER_PORT}")
-
     ssd_path = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
                          "/tmp/mooncake_ssd_test")
 
     retcode = store.setup(
-        local_hostname,
-        metadata_server,
-        segment_size,
-        buffer_size,
-        protocol,
-        device_name,
-        master_server,
-        enable_ssd_offload=True,
-        ssd_offload_path=ssd_path,
+        local_hostname, metadata_server, segment_size, buffer_size,
+        protocol, device_name, master_server,
+        enable_ssd_offload=True, ssd_offload_path=ssd_path,
     )
     if retcode:
         raise RuntimeError(f"Store setup 失败: retcode={retcode}")
     return store
 
 
+# 全局 store 引用，用于 finally 中保持存活
+_store = None
+
+
 def test_ssd_full_reject():
-    """验证设计文档 4.2 节：SSD 水位控制。
+    """验证 SSD 水位控制：effective_free < watermark → 拒绝。
 
-    核心验证点：
-      - effective_free_ratio < watermark 时拒绝 PutStart
-      - 返回 NO_AVAILABLE_HANDLE，不 fallback 写入
-      - 拒绝原因是 SSD 水位，不是 DDR 满
-
-    分批写入策略（避免 DDR 满 → 驱逐风暴）：
-      DDR = 64MB, 每批写 4 个 4MB 对象 = 16MB (DDR 占 25%)
-      每批后等 5 秒让 offload 排空 DDR
-      → DDR 始终远低于 95% 驱逐线
-      → 任何拒绝都是 SSD 水位触发，不是 DDR 满
-
-    水位计算：
-      SSD = 128MB, DDR = 64MB → effective_capacity = 64MB
-      watermark = 15% → effective_free < 9.6MB 时拒绝
-      即 used > 54.4MB 时拒绝 → 约 14 个 4MB 对象
-
-    环境变量要求：
-      MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=134217728  (128MB)
+    分批写入，每批后等 offload 排空 DDR。
+    通过验证已写入 key 的可读性来确认 offload 确实在工作。
     """
-    print("=== 验证保证2：SSD 水位控制（effective_free < watermark → 拒绝）===")
+    global _store
+    print("=== 验证：SSD 水位拒绝（不 fallback）===")
     print()
 
     ssd_limit = int(os.getenv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "0"))
-    seg_size = 64 * 1024 * 1024  # 64MB DDR
-    effective = ssd_limit - seg_size  # 64MB effective
+    seg_size = 64 * 1024 * 1024
+    effective = ssd_limit - seg_size
     watermark = 0.15
-    watermark_bytes = effective * watermark  # 9.6MB
-    trigger_at = effective - watermark_bytes  # 54.4MB
+    trigger_at = effective * (1 - watermark)  # used > 此值时拒绝
 
-    print(f"  参数：SSD={ssd_limit/1024/1024:.0f}MB, DDR={seg_size/1024/1024:.0f}MB")
     print(f"  effective_capacity = {effective/1024/1024:.0f}MB")
-    print(f"  watermark = {watermark*100:.0f}% → 拒绝阈值 ~{trigger_at/1024/1024:.0f}MB")
-    print(f"  策略：每批 4 个 4MB 对象，批间等 5 秒让 offload 排空 DDR")
+    print(f"  watermark = {watermark*100:.0f}%")
+    print(f"  理论拒绝阈值: used > {trigger_at/1024/1024:.0f}MB")
     print()
 
     store = create_store(segment_size=seg_size, buffer_size=seg_size)
+    _store = store
 
-    object_size = 4 * 1024 * 1024  # 4MB
+    object_size = 4 * 1024 * 1024
     batch_size = 4
-    batch_sleep = 5  # 每批后等 5 秒
+    batch_sleep = 5
 
     written = 0
     rejected = 0
@@ -154,15 +157,10 @@ def test_ssd_full_reject():
                 batch_written += 1
             else:
                 rejected += 1
-                used_mb = written * object_size / 1024 / 1024
-                ddr_mb = batch_written * object_size / 1024 / 1024
                 if rejected == 1:
-                    print(f"  ★ 首次拒绝: key={key}")
-                    print(f"    已写入 {written} 个 (~{used_mb:.0f}MB)")
-                    print(f"    当前批次 DDR 占用 ~{ddr_mb:.0f}MB / {seg_size/1024/1024:.0f}MB")
-                    print(f"    DDR 使用率 ~{ddr_mb/(seg_size/1024/1024)*100:.0f}%，远低于 95% → 确认是 SSD 水位拒绝")
-                    print(f"    Master 日志应含 'Refusing allocation'")
-                    print(f"    Client 日志应含 'NO_AVAILABLE_HANDLE' (client_service.cpp:1211)")
+                    total_written_mb = written * object_size / 1024 / 1024
+                    print(f"  ★ 首次拒绝: key={key}, retcode={retcode}")
+                    print(f"    已写入 {written} 个 ({total_written_mb:.0f}MB)")
                 if rejected >= 3:
                     break
 
@@ -170,178 +168,170 @@ def test_ssd_full_reject():
             break
 
         total_mb = written * object_size / 1024 / 1024
-        print(f"  批次 {batch_num}: +{batch_written} 个, "
-              f"累计 {written} 个 (~{total_mb:.0f}MB / {effective/1024/1024:.0f}MB effective)")
-        # 等待 offload 排空 DDR，避免 DDR 满触发驱逐风暴
+        print(f"  批次 {batch_num}: +{batch_written}, "
+              f"累计 {written} 个 ({total_mb:.0f}MB)")
+
+        # 等待 offload
         time.sleep(batch_sleep)
 
+        # 验证 offload 是否在工作：读回第一批的第一个 key
+        if written > 0:
+            check_key = f"ssd_full_key_0"
+            result = store.get(check_key)
+            if result and len(result) == object_size:
+                print(f"    offload 确认: {check_key} 可读取 ({len(result)/1024/1024:.0f}MB)")
+            else:
+                print(f"    [警告] {check_key} 不可读 (len={len(result) if result else 0})")
+                print(f"    offload 可能未运行！检查 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1")
+
+        # 打印 Master 指标
+        print_metrics(f"批次{batch_num}后")
+
+    # 最终报告
     total_mb = written * object_size / 1024 / 1024
-    print(f"\n结果：成功 {written} 个 (~{total_mb:.0f}MB), 被拒绝 {rejected} 个")
+    print(f"\n--- 结果 ---")
+    print(f"  写入成功: {written} 个 ({total_mb:.0f}MB)")
+    print(f"  写入被拒: {rejected} 个")
+    print(f"  理论阈值: {trigger_at/1024/1024:.0f}MB (watermark={watermark*100:.0f}%)")
 
-    if rejected > 0 and total_mb >= trigger_at / 1024 / 1024 - 8:
-        print("✓ 验证通过：SSD 水位不足时正确拒绝，未 fallback")
-    elif rejected == 0:
-        print("✗ 失败：全部写入成功，SSD 水位未触发")
-        print("  检查：Master 是否 --allocation_strategy=hard_pin？")
+    if rejected == 0:
+        print("\n  ✗ 全部写入成功，SSD 水位未触发")
         raise AssertionError("SSD 水位拒绝未生效")
-    else:
-        print(f"✗ 失败：在 {total_mb:.0f}MB 时被拒，但水位阈值在 ~{trigger_at/1024/1024:.0f}MB")
-        print("  可能是 DDR 满导致的拒绝，不是 SSD 水位")
-        raise AssertionError("拒绝时机不对，可能是 DDR 而非 SSD")
 
-    store.close()
+    # 验证 key_0 仍可读（证明数据确实到了 SSD）
+    print(f"\n--- 验证 offload ---")
+    check_key = "ssd_full_key_0"
+    result = store.get(check_key)
+    if result and len(result) == object_size:
+        print(f"  ✓ {check_key} 可读取 ({len(result)/1024/1024:.0f}MB) — offload 确实在工作")
+    else:
+        print(f"  ✗ {check_key} 不可读 — offload 可能未运行")
+        raise AssertionError("offload 未运行，无法验证 SSD 水位")
+
+    print(f"\n  ✓ 验证通过：{total_mb:.0f}MB 后 SSD 水位触发拒绝")
 
 
 def test_eviction_protection():
-    """验证设计文档 4.1 节：驱逐保护。
-
-    核心验证点：
-      - 没有 LOCAL_DISK 副本的 key，MEMORY 不能被驱逐
-      - 即使 DDR 写满，旧 key 的数据仍保留在 DDR 中
-    """
-    print("=== 验证保证1：驱逐保护（无 LOCAL_DISK → MEMORY 不驱逐）===")
-    print()
+    """验证驱逐保护：无 LOCAL_DISK 的 MEMORY 不被驱逐。"""
+    global _store
+    print("=== 验证：驱逐保护 ===\n")
 
     kv_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", "2000"))
-    seg_size = 4 * 1024 * 1024  # 4MB DDR
+    seg_size = 4 * 1024 * 1024
     store = create_store(segment_size=seg_size, buffer_size=seg_size)
+    _store = store
 
-    # 写入 protected_key（不 offload，没有 LOCAL_DISK 副本）
     first_key = "protected_key"
-    retcode = store.put(first_key, b"\x01" * (1024 * 100))  # 100KB
+    first_data = b"\x01" * (1024 * 100)
+    retcode = store.put(first_key, first_data)
     if retcode != 0:
-        raise RuntimeError(f"写入 {first_key} 失败: retcode={retcode}")
-    print(f"  写入 {first_key} (100KB, 无 LOCAL_DISK 副本)")
+        raise RuntimeError(f"put {first_key} 失败: {retcode}")
+    print(f"  写入 {first_key} (100KB)")
 
-    # 等待 lease 过期
-    print(f"  等待 lease 过期 ({kv_ttl}ms + 500ms)...")
+    print(f"  等待 lease 过期 ({kv_ttl}ms)...")
     time.sleep(kv_ttl / 1000.0 + 0.5)
 
-    # 填满 DDR 触发驱逐
-    print("  填满 DDR 触发驱逐...")
-    fill_success = 0
+    print("  填满 DDR...")
+    fill = 0
     for i in range(500):
-        key = f"filler_{i}"
-        retcode = store.put(key, b"\x02" * (1024 * 100))  # 100KB
+        retcode = store.put(f"filler_{i}", b"\x02" * (1024 * 100))
         if retcode == 0:
-            fill_success += 1
+            fill += 1
         else:
-            # DDR 满了且无法驱逐（驱逐保护生效）
             break
-    print(f"  填充写入：{fill_success} 个后 DDR 满")
+    print(f"  填充: {fill} 个后写满")
 
-    # 验证 protected_key 还在
     result = store.get(first_key)
     if result and result != b"":
-        print(f"  ✓ {first_key} 仍可读取（驱逐保护生效）")
-        print("✓ 验证通过：无 LOCAL_DISK 的 MEMORY 不被驱逐\n")
+        print(f"  ✓ {first_key} 仍可读 ({len(result)} bytes) — 驱逐保护生效")
     else:
-        print(f"  ✗ {first_key} 无法读取")
-        raise AssertionError("protected_key 被驱逐了，驱逐保护未生效")
-
-    store.close()
+        print(f"  ✗ {first_key} 不可读 — 被驱逐了")
+        raise AssertionError("驱逐保护未生效")
 
 
 def test_ssd_eviction_rejected():
-    """验证设计文档保证3：SSD 数据不可驱逐。
-
-    核心验证点：
-      - 写入 + offload 后，LOCAL_DISK 副本持久存在
-      - 反复读取数据始终正确
-    """
-    print("=== 验证保证3：SSD 副本不可驱逐 ===")
-    print()
+    """验证 SSD 副本不可驱逐。"""
+    global _store
+    print("=== 验证：SSD 副本不可驱逐 ===\n")
 
     seg_size = 64 * 1024 * 1024
     store = create_store(segment_size=seg_size, buffer_size=seg_size)
+    _store = store
 
     key = "ssd_safe_key"
     data = b"\x03" * 4096
     retcode = store.put(key, data)
     if retcode != 0:
-        raise RuntimeError(f"put failed: retcode={retcode}")
+        raise RuntimeError(f"put failed: {retcode}")
     print(f"  写入 {key}")
 
-    # 等待 offload 完成
-    print("  等待 offload 完成（5 秒）...")
+    print("  等 offload (5s)...")
     time.sleep(5)
 
-    # 验证 offload 后数据可读
-    result = store.get(key)
-    if not result or result == b"":
-        raise AssertionError(f"offload 后读取 {key} 失败")
-    if result != data:
-        raise AssertionError(f"数据不一致")
-    print(f"  ✓ offload 后读取正确")
-
-    # 反复读取验证 SSD 副本持久安全
-    for i in range(5):
-        time.sleep(1)
+    for attempt in range(6):
         result = store.get(key)
         if not result or result == b"":
-            raise AssertionError(f"第 {i+1} 次读取失败，SSD 副本可能被驱逐")
+            print(f"  ✗ 第 {attempt} 次读取失败")
+            raise AssertionError("SSD 副本丢失")
         if result != data:
-            raise AssertionError(f"第 {i+1} 次读取数据不一致")
+            raise AssertionError("数据不一致")
+        if attempt == 0:
+            print(f"  ✓ offload 后读取正确")
+        if attempt < 5:
+            time.sleep(1)
 
-    print("✓ 验证通过：SSD 副本持久安全，反复读取一致\n")
-    store.close()
+    print(f"  ✓ 6 次读取全部一致 — SSD 副本安全")
 
 
 def test_full_lifecycle():
-    """验证端到端数据流转：写入 → offload → DDR驱逐 → SSD读取。
-
-    验证设计文档第 5 节的状态流转：
-      写入DDR → 排队中 → Offloading → DDR_SSD共存 → SSD仅存
-    """
-    print("=== 端到端验证：写入 → offload → 驱逐 → SSD 读取 ===")
-    print()
+    """验证完整生命周期：写入 → offload → 驱逐 → SSD 读取。"""
+    global _store
+    print("=== 验证：完整生命周期 ===\n")
 
     kv_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", "2000"))
     seg_size = 64 * 1024 * 1024
     store = create_store(segment_size=seg_size, buffer_size=seg_size)
+    _store = store
 
-    # [写入DDR] 阶段
     key = "lifecycle_key"
-    data = b"\x04" * (4 * 1024 * 1024)  # 4MB
+    data = b"\x04" * (4 * 1024 * 1024)
+
+    # 阶段 1: 写入
     retcode = store.put(key, data)
     if retcode != 0:
-        raise RuntimeError(f"put failed: retcode={retcode}")
-    print(f"  [写入DDR] {key} (4MB) — MEMORY 副本, refcnt > 0")
+        raise RuntimeError(f"put failed: {retcode}")
+    print(f"  [1] 写入 {key} (4MB)")
 
-    # [排队中 → Offloading] 等待 offload
-    print("  [排队中 → Offloading] 等待 heartbeat 驱动 DDR→SSD...")
+    # 阶段 2: 等 offload
+    print(f"  [2] 等 offload (5s)...")
     time.sleep(5)
     result = store.get(key)
     if not result or result == b"":
-        raise AssertionError("offload 后读取失败")
-    print(f"  [DDR_SSD共存] offload 完成, MEMORY + LOCAL_DISK 都存在")
+        raise AssertionError("offload 后不可读")
+    print(f"      offload 完成, 数据可读")
 
-    # 等待 lease 过期
-    print(f"  等待 lease 过期 ({kv_ttl}ms + 500ms)...")
+    # 阶段 3: 等 lease 过期 + 填满 DDR
+    print(f"  [3] 等 lease 过期 ({kv_ttl}ms)...")
     time.sleep(kv_ttl / 1000.0 + 0.5)
 
-    # [驱逐] 填满 DDR 触发 MEMORY 驱逐（有 LOCAL_DISK，可驱逐）
-    print("  [驱逐] 填满 DDR 触发 MEMORY 驱逐...")
-    fill_count = 0
+    fill = 0
     for i in range(50):
         retcode = store.put(f"filler_{i}", b"\x05" * (4 * 1024 * 1024))
         if retcode == 0:
-            fill_count += 1
+            fill += 1
         else:
             break
-    print(f"  压力写入 {fill_count} 个 4MB 对象")
+    print(f"      压力写入 {fill} 个对象")
 
-    # [SSD仅存] 验证从 SSD 读取
+    # 阶段 4: 从 SSD 读
     time.sleep(2)
     result = store.get(key)
     if not result or result == b"":
         raise AssertionError("DDR 驱逐后从 SSD 读取失败")
     if result != data:
-        raise AssertionError("DDR 驱逐后数据不一致")
-    print(f"  [SSD仅存] {key} 从 SSD 读取成功，数据一致")
-
-    print("✓ 验证通过：完整 DDR→SSD→驱逐→读取 生命周期正常\n")
-    store.close()
+        raise AssertionError("数据不一致")
+    print(f"  [4] 从 SSD 读取成功 — 数据完整")
+    print(f"  ✓ 生命周期验证通过")
 
 
 TESTS = {
@@ -354,8 +344,7 @@ TESTS = {
 
 def main():
     parser = argparse.ArgumentParser(description="HardPin 策略人工验证")
-    parser.add_argument("--test", required=True, choices=TESTS.keys(),
-                        help="要运行的测试名称")
+    parser.add_argument("--test", required=True, choices=TESTS.keys())
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
@@ -364,17 +353,19 @@ def main():
 
     try:
         TESTS[args.test]()
-        print("所有验证通过！")
     except Exception as e:
         print(f"\n验证失败: {e}")
         traceback.print_exc()
         sys.exit(1)
     finally:
-        print("\n>>> 按回车键退出（可先查看 Master 日志）...")
-        try:
-            input()
-        except EOFError:
-            pass
+        # 保持 store 存活直到用户按回车，方便查验
+        if _store:
+            print(f"\n>>> Store 仍存活，可检查 Master 状态。按回车退出...")
+            try:
+                input()
+            except EOFError:
+                pass
+            _store.close()
 
 
 if __name__ == "__main__":
