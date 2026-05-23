@@ -10,7 +10,7 @@
 
 ## 验证脚本
 
-验证脚本位于 `mooncake-wheel/tests/verify_hard_pin.py`，支持 5 个测试场景：
+验证脚本位于 `mooncake-wheel/tests/verify_hard_pin.py`，支持 6 个测试场景：
 
 ```
 python verify_hard_pin.py --test <test_name>
@@ -23,6 +23,7 @@ python verify_hard_pin.py --test <test_name>
 | `eviction_protection` | 无 LOCAL_DISK 副本的 MEMORY 不被驱逐 |
 | `ssd_eviction_rejected` | SSD (LOCAL_DISK) 副本不能被驱逐 |
 | `full_lifecycle` | 完整 写入→offload→驱逐→读取 生命周期 |
+| `load_balancing` | 多 Client 负载均衡：2 个 Client，向一个写入，检查 SSD 分布 |
 
 ## 默认规模
 
@@ -34,6 +35,7 @@ DDR=4GB, SSD=16GB, Key=4MB
 
 ## 注意事项
 
+- **每次测试前清空 SSD 目录**：上次测试残留的 bucket 文件会导致 offload 异常或 OBJECT_ALREADY_EXISTS 错误。每次运行前执行 `rm -rf <SSD_PATH> && mkdir -p <SSD_PATH>`。
 - **SSD 显示 infinity 的原因**：如果未设置 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`，默认为 2TB，表现为 "infinity"。脚本会检查此环境变量，未设置时报错退出。
 - **put() 不抛异常**：`store.put()` 返回整数状态码（0=成功, 非0=失败），不会抛异常。
 - **进程会等待退出**：脚本结束时打印 `>>> 按回车退出`，方便查看 Master 日志后再退出。
@@ -127,7 +129,7 @@ Master 回显中搜索：
 
 ## 验证 2：驱逐保护（DDR 中无 LOCAL_DISK 副本的数据不被驱逐）
 
-此测试使用小 DDR（4MB）以便快速触发驱逐。
+此测试使用最小 DDR（16MB）并**关闭 SSD offload**，确保 `protected_key` 不会获得 LOCAL_DISK 副本，快速触发驱逐保护。
 
 **Terminal 1** — 启动 Master：
 
@@ -142,14 +144,11 @@ mooncake_master \
     --default_kv_lease_ttl=500
 ```
 
-**Terminal 2** — 运行验证脚本：
+**Terminal 2** — 运行验证脚本（不需要 SSD 相关环境变量）：
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
 DEFAULT_KV_LEASE_TTL=500 \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=17179869184 \
-MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
-MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_hardpin_evict_test \
 python mooncake-wheel/tests/verify_hard_pin.py --test eviction_protection
 ```
 
@@ -176,7 +175,7 @@ mooncake_master \
     --default_kv_lease_ttl=2000
 ```
 
-**Terminal 2** — 运行验证脚本：
+**Terminal 2** — 运行验证脚本（SSD 目录由脚本自动创建）：
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
@@ -225,6 +224,46 @@ python mooncake-wheel/tests/verify_hard_pin.py --test full_lifecycle
 2. 等待 20 秒 offload 完成
 3. 等 lease 过期后压力写入 1100 个 4MB key（4.4GB > 4GB DDR）触发驱逐
 4. `get("lifecycle_key")` → 成功（从 SSD 读取）
+
+---
+
+## 验证 5：多 Client 负载均衡
+
+本地启动 2 个 Client 进程，向其中一个写入，观察 SSD 数据是否跨节点分布。
+
+**Terminal 1** — 启动 Master：
+
+```bash
+mooncake_master \
+    --port=50053 \
+    --http_metadata_server_port=8880 \
+    --enable_http_metadata_server=true \
+    --metrics_port=9104 \
+    --allocation_strategy=hard_pin \
+    --enable_offload=true \
+    --default_kv_lease_ttl=2000
+```
+
+**Terminal 2** — 运行验证脚本：
+
+```bash
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=17179869184 \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+python mooncake-wheel/tests/verify_hard_pin.py --test load_balancing
+```
+
+### 预期观察
+
+- 脚本自动创建两个 Client，使用不同的 SSD 路径
+- Client 1 写入数据后，等待 30s offload
+- 检查两个 SSD 目录：**两者均应有数据文件**
+- 若仅 Client 1 的 SSD 有数据，说明负载均衡未生效
+
+### 判断标准
+
+- Master 日志中两个 segment 的 SSD 使用量均应 > 0
+- 脚本输出中两个 SSD 目录的文件大小均应 > 0
 
 ---
 

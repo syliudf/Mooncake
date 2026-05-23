@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """HardPin 策略人工验证脚本。
 
-验证设计文档（hard_pin_design.md）中的三大核心保证：
-  1. 驱逐保护（4.1）：无 LOCAL_DISK 副本的 MEMORY 不被驱逐
-  2. SSD 水位控制（4.2）：effective_free_ratio < watermark → 拒绝分配
+验证设计文档（hard_pin_design.md）中的核心保证：
+  1. SSD 水位控制（4.2）：effective_free_ratio < watermark → 拒绝分配
+  2. 驱逐保护（4.1）：无 LOCAL_DISK 副本的 MEMORY 不被驱逐
   3. SSD 不可驱逐：LOCAL_DISK 副本在任何情况下不被驱逐
+  4. 负载均衡（4.2）：多 Client 下 SSD 水位控制实现负载均衡
 
 用法：
     python verify_hard_pin.py --test <test_name>
+
+每次测试前请清理 SSD 目录：rm -rf <SSD_PATH> && mkdir -p <SSD_PATH>
 
 关键环境变量：
     MC_METADATA_SERVER                        - Master 元数据地址
@@ -104,30 +107,37 @@ def print_all_metrics(label=""):
 
 
 def create_store(segment_size=DEFAULT_DDR_SIZE,
-                 buffer_size=DEFAULT_DDR_SIZE):
+                 buffer_size=DEFAULT_DDR_SIZE,
+                 enable_offload=True,
+                 ssd_path_override=None):
     """创建 Store 客户端。"""
-    ssd_limit_str = os.getenv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "")
-    if not ssd_limit_str:
-        print("[ERROR] MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES 未设置！")
-        sys.exit(1)
-
-    ssd_limit = int(ssd_limit_str)
-    effective = ssd_limit - segment_size
-    if effective <= 0:
-        print(f"[ERROR] SSD({ssd_limit}) 必须 > DDR({segment_size})")
-        sys.exit(1)
-
-    ssd_path = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
-                         "/tmp/mooncake_ssd_test")
-    heartbeat_interval = os.getenv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-                                   "(未设置, 默认10s)")
+    ssd_path = ""
+    if enable_offload:
+        ssd_limit_str = os.getenv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "")
+        if not ssd_limit_str:
+            print("[ERROR] MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES 未设置！")
+            sys.exit(1)
+        ssd_limit = int(ssd_limit_str)
+        effective = ssd_limit - segment_size
+        if effective <= 0:
+            print(f"[ERROR] SSD({ssd_limit}) 必须 > DDR({segment_size})")
+            sys.exit(1)
+        ssd_path = ssd_path_override or os.getenv(
+            "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_ssd_test")
+        heartbeat_interval = os.getenv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+                                        "(未设置, 默认10s)")
+        # Auto-create SSD path if it doesn't exist
+        os.makedirs(ssd_path, exist_ok=True)
 
     print(f"  配置:")
-    print(f"    SSD: {ssd_limit/1024/1024/1024:.1f}GB")
     print(f"    DDR: {segment_size/1024/1024/1024:.1f}GB")
-    print(f"    effective: {effective/1024/1024/1024:.1f}GB")
-    print(f"    SSD 路径: {ssd_path}")
-    print(f"    心跳间隔: {heartbeat_interval}s")
+    if enable_offload:
+        print(f"    SSD: {ssd_limit/1024/1024/1024:.1f}GB")
+        print(f"    effective: {effective/1024/1024/1024:.1f}GB")
+        print(f"    SSD 路径: {ssd_path}")
+        print(f"    心跳间隔: {heartbeat_interval}s")
+    else:
+        print(f"    SSD offload: DISABLED")
 
     store = MooncakeDistributedStore()
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -145,7 +155,8 @@ def create_store(segment_size=DEFAULT_DDR_SIZE,
     retcode = store.setup(
         local_hostname, metadata_server, segment_size, buffer_size,
         protocol, device_name, master_server,
-        enable_ssd_offload=True, ssd_offload_path=ssd_path,
+        enable_ssd_offload=enable_offload,
+        ssd_offload_path=ssd_path,
     )
     elapsed = time.time() - t0
     if retcode:
@@ -309,9 +320,12 @@ def test_eviction_protection():
     print("=== 验证：驱逐保护 ===\n")
 
     kv_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", "2000"))
-    # 用小 DDR 以便快速触发驱逐
-    seg_size = 4 * 1024 * 1024
-    store = create_store(segment_size=seg_size, buffer_size=seg_size)
+    # 最小允许的 segment 大小是 16MB，用此值以便快速触发驱逐。
+    # 关闭 offload 确保 protected_key 不会有 LOCAL_DISK 副本，
+    # 从而保证驱逐保护逻辑一定被触发。
+    seg_size = 16 * 1024 * 1024  # 16MB (最低要求)
+    store = create_store(segment_size=seg_size, buffer_size=seg_size,
+                         enable_offload=False)
     _store = store
 
     first_key = "protected_key"
@@ -324,16 +338,18 @@ def test_eviction_protection():
     print(f"  等待 lease 过期 ({kv_ttl}ms)...")
     time.sleep(kv_ttl / 1000.0 + 0.5)
 
-    print("  填满 DDR...")
+    # 用 2MB filler key 填 16MB DDR（约 8 次写入即可填满）。
+    filler_size = 2 * 1024 * 1024  # 2MB
+    print(f"  填满 DDR (每次 {filler_size/1024/1024:.0f}MB)...")
     fill = 0
-    for i in range(500):
-        retcode = store.put(f"filler_{i}", b"\x02" * (1024 * 100))
+    for i in range(200):
+        retcode = store.put(f"filler_{i}", b"\x02" * filler_size)
         if retcode == 0:
             fill += 1
         else:
             break
         time.sleep(INSERT_INTERVAL)
-    print(f"  填充: {fill} 个后写满")
+    print(f"  填充: {fill} 个后写满 ({fill * filler_size / 1024 / 1024:.0f}MB)")
 
     result = store.get(first_key)
     if result and result != b"":
@@ -439,12 +455,90 @@ def test_full_lifecycle():
     print(f"  ✓ 生命周期验证通过")
 
 
+def test_load_balancing():
+    """验证多 Client 负载均衡：开 2 个 Client，向 Client 1 写入，观察 SSD 分布。"""
+    global _store
+    print("=== 验证：多 Client 负载均衡 ===\n")
+
+    import shutil
+
+    seg_size = DEFAULT_DDR_SIZE
+
+    # 两个 Client 使用不同的 SSD 路径
+    ssd_path_1 = "/tmp/mooncake_lb_test_1"
+    ssd_path_2 = "/tmp/mooncake_lb_test_2"
+
+    # 清理旧数据
+    print("  清理旧 SSD 数据...")
+    for p in [ssd_path_1, ssd_path_2]:
+        if os.path.exists(p):
+            shutil.rmtree(p)
+        os.makedirs(p, exist_ok=True)
+
+    print(f"\n  [1] 启动 Client 2 (SSD={ssd_path_2})...")
+    store2 = create_store(segment_size=seg_size, buffer_size=seg_size,
+                          ssd_path_override=ssd_path_2)
+    print(f"  Client 2 启动成功")
+
+    print(f"\n  [2] 启动 Client 1 (SSD={ssd_path_1})...")
+    store1 = create_store(segment_size=seg_size, buffer_size=seg_size,
+                          ssd_path_override=ssd_path_1)
+    _store = store1
+    print(f"  Client 1 启动成功")
+
+    print_metrics("两个 Client 均已注册")
+
+    # Client 1 写入数据
+    num_keys = 100
+    print(f"\n  [3] Client 1 写入 {num_keys} 个 4MB key ({num_keys * 4}MB)...")
+
+    written = 0
+    for i in range(num_keys):
+        key = f"lb_key_{i}"
+        data = b"\xAB" * KEY_SIZE
+        retcode = store1.put(key, data)
+        if retcode == 0:
+            written += 1
+        else:
+            print(f"    put failed at key {i}: retcode={retcode}")
+            break
+        if (i + 1) % 25 == 0:
+            print(f"    {i+1}/{num_keys}")
+        time.sleep(INSERT_INTERVAL)
+
+    print(f"  写入成功: {written} 个 ({written * 4}MB)")
+    print_metrics("写入后")
+
+    offload_wait = 30
+    print(f"\n  [4] 等待 {offload_wait}s 让 offload 完成...")
+    wait_with_progress(offload_wait)
+
+    print_metrics("offload 后")
+
+    # 检查两个 SSD 目录的文件大小
+    for label, path in [("Client 1 SSD", ssd_path_1), ("Client 2 SSD", ssd_path_2)]:
+        if os.path.exists(path):
+            files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+            total_size = sum(os.path.getsize(os.path.join(path, f)) for f in files)
+            print(f"  {label}: {len(files)} 个文件, {total_size/1024/1024:.0f}MB")
+        else:
+            print(f"  {label}: 目录不存在")
+
+    print(f"\n  ✓ 负载均衡测试完成 — 检查上述 SSD 分布")
+    print(f"    若两个 Client 的 SSD 均有数据，说明负载均衡正常")
+    print(f"    若仅 Client 1 的 SSD 有数据，说明数据未跨节点分配")
+
+    # 关闭 Client 2
+    store2.close()
+
+
 TESTS = {
     "offload_only": test_offload_only,
     "ssd_full_reject": test_ssd_full_reject,
     "eviction_protection": test_eviction_protection,
     "ssd_eviction_rejected": test_ssd_eviction_rejected,
     "full_lifecycle": test_full_lifecycle,
+    "load_balancing": test_load_balancing,
 }
 
 
