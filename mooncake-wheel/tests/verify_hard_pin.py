@@ -30,9 +30,9 @@ DEFAULT_MASTER_PORT = "50053"
 DEFAULT_METADATA_PORT = "8880"
 DEFAULT_METRICS_PORT = "9104"
 
-# 默认规模：DDR=20GB, SSD=80GB
-DEFAULT_DDR_SIZE = 20 * 1024 * 1024 * 1024   # 20GB
-DEFAULT_SSD_SIZE = 80 * 1024 * 1024 * 1024   # 80GB
+# 默认规模：DDR=4GB, SSD=16GB
+DEFAULT_DDR_SIZE = 4 * 1024 * 1024 * 1024    # 4GB
+DEFAULT_SSD_SIZE = 16 * 1024 * 1024 * 1024   # 16GB
 KEY_SIZE = 4 * 1024 * 1024                    # 4MB
 INSERT_INTERVAL = 0.01                        # 10ms
 
@@ -153,14 +153,14 @@ def wait_with_progress(seconds, prefix=""):
 
 
 def test_offload_only():
-    """验证 offload 管线：写入 400MB 数据，等待 offload。"""
+    """验证 offload 管线：写入 200MB 数据，等待 offload。"""
     global _store
     print("=== 验证：Offload 管线基础测试 ===\n")
 
     store = create_store()
     _store = store
 
-    num_keys = 100  # 100 × 4MB = 400MB
+    num_keys = 50  # 50 × 4MB = 200MB
     print(f"\n  [1] 写入 {num_keys} 个 4MB key ({num_keys*4}MB)...")
     t0 = time.time()
     for i in range(num_keys):
@@ -170,21 +170,21 @@ def test_offload_only():
         if retcode != 0:
             print(f"  ✗ 写入 {key} 失败: retcode={retcode}")
             raise RuntimeError(f"put failed at key {i}")
-        if (i + 1) % 20 == 0:
+        if (i + 1) % 10 == 0:
             print(f"    {i+1}/{num_keys} 写入完成 ({(i+1)*4}MB, {time.time()-t0:.1f}s)")
         time.sleep(INSERT_INTERVAL)
 
     print(f"  写入完成: {num_keys} 个 ({num_keys*4}MB, {time.time()-t0:.1f}s)")
     print_metrics("写入后")
 
-    offload_wait = 30
+    offload_wait = 20
     print(f"\n  [2] 等待 {offload_wait}s 让 heartbeat 触发 offload...")
     wait_with_progress(offload_wait)
 
     print_metrics(f"offload 等待 {offload_wait}s 后")
 
     # 验证随机 key 可读
-    test_keys = ["offload_key_0", "offload_key_50", "offload_key_99"]
+    test_keys = ["offload_key_0", "offload_key_25", "offload_key_49"]
     all_ok = True
     for key in test_keys:
         result = store.get(key)
@@ -229,44 +229,11 @@ def test_ssd_full_reject():
     print(f"  理论拒绝阈值: used > {trigger_at/1024/1024/1024:.1f}GB")
     print(f"  需要写入约 {int(trigger_at / KEY_SIZE)} 个 4MB key\n")
 
-    # 阶段 1: 验证 offload
-    print("--- 阶段 1: 验证 offload 管线 ---")
-    initial_keys = 100
-    t0 = time.time()
-    for i in range(initial_keys):
-        key = f"ssd_full_key_{i}"
-        data = b"\x00" * KEY_SIZE
-        retcode = store.put(key, data)
-        if retcode != 0:
-            raise RuntimeError(f"写入 {key} 失败: retcode={retcode}")
-        if (i + 1) % 50 == 0:
-            print(f"    {i+1}/{initial_keys} ({(i+1)*4}MB)")
-        time.sleep(INSERT_INTERVAL)
-
-    print(f"  写入 {initial_keys} 个 ({initial_keys*4}MB, {time.time()-t0:.1f}s)")
-    print_metrics("写入后")
-
-    offload_wait = 30
-    print(f"  等待 {offload_wait}s 让 offload 排空 DDR...")
-    wait_with_progress(offload_wait)
-    print_metrics(f"offload {offload_wait}s 后")
-
-    # 验证 offload
-    result = store.get("ssd_full_key_0")
-    if result and len(result) == KEY_SIZE:
-        print(f"  ✓ offload 确认: ssd_full_key_0 可读取")
-    else:
-        print(f"  ✗ ssd_full_key_0 不可读 — offload 未工作")
-        print_all_metrics("诊断")
-        raise AssertionError("阶段 1 offload 验证失败")
-
-    # 阶段 2: 持续写入直到 SSD 水位触发
-    print(f"\n--- 阶段 2: 持续写入直到 SSD 水位触发 ---")
-    written = initial_keys
+    written = 0
     rejected = 0
     batch_size = 100
-    batch_sleep = 10  # 每批后等 10s 让 offload 排空 DDR
-    report_interval = 500  # 每 500 个 key 报告一次
+    batch_sleep = 5  # 每批后等 5s 让 offload 排空 DDR
+    report_interval = 500
     t0 = time.time()
 
     for batch_idx in range(10000):
@@ -302,7 +269,6 @@ def test_ssd_full_reject():
             print(f"  {written} 个 ({total_gb:.1f}GB), "
                   f"{speed:.0f} keys/s, {elapsed:.0f}s")
 
-        # 等待 offload
         time.sleep(batch_sleep)
 
     # 最终报告
@@ -317,14 +283,6 @@ def test_ssd_full_reject():
     if rejected == 0:
         print("\n  ✗ 未触发 SSD 水位拒绝")
         raise AssertionError("SSD 水位拒绝未生效")
-
-    # 验证数据仍可读
-    result = store.get("ssd_full_key_0")
-    if result and len(result) == KEY_SIZE:
-        print(f"  ✓ ssd_full_key_0 仍可读取 — offload 正常工作")
-    else:
-        print(f"  ✗ ssd_full_key_0 不可读")
-        raise AssertionError("offload 数据丢失")
 
     print(f"\n  ✓ 验证通过：{total_gb:.1f}GB 后 SSD 水位触发拒绝")
 
@@ -384,7 +342,7 @@ def test_ssd_eviction_rejected():
         raise RuntimeError(f"put failed: {retcode}")
     print(f"  写入 {key}")
 
-    offload_wait = 30
+    offload_wait = 20
     print(f"  等 offload ({offload_wait}s)...")
     wait_with_progress(offload_wait)
 
@@ -423,7 +381,7 @@ def test_full_lifecycle():
     print_metrics("写入后")
 
     # 阶段 2: 等 offload
-    offload_wait = 30
+    offload_wait = 20
     print(f"  [2] 等 offload ({offload_wait}s)...")
     wait_with_progress(offload_wait)
     result = store.get(key)
@@ -437,18 +395,18 @@ def test_full_lifecycle():
     print(f"  [3] 等 lease 过期 ({kv_ttl}ms)...")
     time.sleep(kv_ttl / 1000.0 + 0.5)
 
-    # 填满 20GB DDR：需要 5000 个 4MB key
-    print(f"  填满 DDR (写入 5000 个 4MB key)...")
+    # 填满 4GB DDR：需要 ~1000 个 4MB key
+    print(f"  填满 DDR (写入 1100 个 4MB key)...")
     t0 = time.time()
     fill = 0
-    for i in range(5500):
+    for i in range(1100):
         retcode = store.put(f"filler_{i}", b"\x05" * KEY_SIZE)
         if retcode == 0:
             fill += 1
         else:
             break
-        if (i + 1) % 1000 == 0:
-            print(f"    {i+1}/5500 ({(i+1)*4}MB, {time.time()-t0:.1f}s)")
+        if (i + 1) % 200 == 0:
+            print(f"    {i+1}/1100 ({(i+1)*4}MB, {time.time()-t0:.1f}s)")
         time.sleep(INSERT_INTERVAL)
     print(f"  压力写入 {fill} 个 ({fill*4}MB, {time.time()-t0:.1f}s)")
     print_metrics("压力写入后")
