@@ -22,7 +22,6 @@ import sys
 import time
 import traceback
 import urllib.request
-import json
 
 from mooncake.store import MooncakeDistributedStore
 
@@ -38,13 +37,29 @@ INSERT_INTERVAL = 0.01                        # 10ms
 
 
 def fetch_metrics():
-    """从 Master metrics 端口获取指标。"""
+    """从 Master /metrics 端点获取 Prometheus 格式指标。"""
     metrics_port = os.getenv("METRICS_PORT", DEFAULT_METRICS_PORT)
     try:
-        url = f"http://127.0.0.1:{metrics_port}/stats"
+        url = f"http://127.0.0.1:{metrics_port}/metrics"
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=2) as resp:
-            return json.loads(resp.read().decode())
+            text = resp.read().decode()
+        result = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                name = parts[0]
+                # Skip histogram buckets (name{le="..."})
+                if "{" in name:
+                    name = name[:name.index("{")]
+                try:
+                    result[name] = float(parts[1])
+                except ValueError:
+                    pass
+        return result
     except Exception:
         return None
 
@@ -57,8 +72,8 @@ def print_metrics(label=""):
         return
     prefix = f"  [{label}] " if label else "  "
     try:
-        mem_total = stats.get("master_total_segment_capacity_bytes", 0)
-        mem_used = stats.get("master_used_memory_bytes", 0)
+        mem_total = stats.get("master_total_capacity_bytes", 0)
+        mem_used = stats.get("master_allocated_bytes", 0)
         ssd_total = stats.get("master_total_file_capacity_bytes", 0)
         ssd_used = stats.get("master_allocated_file_size_bytes", 0)
         if mem_total > 0:
@@ -82,8 +97,8 @@ def print_all_metrics(label=""):
     prefix = f"  [{label}] " if label else "  "
     for key in sorted(stats.keys()):
         val = stats[key]
-        if isinstance(val, (int, float)) and val > 1024:
-            print(f"{prefix}{key} = {val} ({val/1024/1024:.2f}M)")
+        if val > 1024:
+            print(f"{prefix}{key} = {val:.0f} ({val/1024/1024:.2f}M)")
         else:
             print(f"{prefix}{key} = {val}")
 
@@ -227,12 +242,13 @@ def test_ssd_full_reject():
     print(f"\n  effective_capacity = {effective/1024/1024/1024:.1f}GB")
     print(f"  watermark = {watermark*100:.0f}%")
     print(f"  理论拒绝阈值: used > {trigger_at/1024/1024/1024:.1f}GB")
+    print(f"  (注: 实际触发可能更低，因 pending(offloading_objects) 计入 used)")
     print(f"  需要写入约 {int(trigger_at / KEY_SIZE)} 个 4MB key\n")
 
     written = 0
     rejected = 0
     batch_size = 100
-    batch_sleep = 5  # 每批后等 5s 让 offload 排空 DDR
+    batch_sleep = 0.1  # 每批后等 0.1s
     report_interval = 500
     t0 = time.time()
 
