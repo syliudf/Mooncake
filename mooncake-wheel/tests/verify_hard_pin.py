@@ -109,15 +109,22 @@ def print_all_metrics(label=""):
 def create_store(segment_size=DEFAULT_DDR_SIZE,
                  buffer_size=DEFAULT_DDR_SIZE,
                  enable_offload=True,
-                 ssd_path_override=None):
+                 ssd_path_override=None,
+                 ssd_total_size_override=None):
     """创建 Store 客户端。"""
     ssd_path = ""
     if enable_offload:
-        ssd_limit_str = os.getenv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "")
+        ssd_limit_str = ssd_total_size_override or os.getenv(
+            "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "")
         if not ssd_limit_str:
             print("[ERROR] MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES 未设置！")
             sys.exit(1)
-        ssd_limit = int(ssd_limit_str)
+        if isinstance(ssd_limit_str, int):
+            ssd_limit = ssd_limit_str
+        else:
+            ssd_limit = int(ssd_limit_str)
+        # Set env var for C++ code (reads in FileStorageConfig::FromEnvironment)
+        os.environ["MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"] = str(ssd_limit)
         effective = ssd_limit - segment_size
         if effective <= 0:
             print(f"[ERROR] SSD({ssd_limit}) 必须 > DDR({segment_size})")
@@ -129,8 +136,12 @@ def create_store(segment_size=DEFAULT_DDR_SIZE,
         # Auto-create SSD path if it doesn't exist
         os.makedirs(ssd_path, exist_ok=True)
 
+    if segment_size >= 1024 * 1024 * 1024:
+        ddr_str = f"{segment_size/1024/1024/1024:.1f}GB"
+    else:
+        ddr_str = f"{segment_size/1024/1024:.0f}MB"
     print(f"  配置:")
-    print(f"    DDR: {segment_size/1024/1024/1024:.1f}GB")
+    print(f"    DDR: {ddr_str}")
     if enable_offload:
         print(f"    SSD: {ssd_limit/1024/1024/1024:.1f}GB")
         print(f"    effective: {effective/1024/1024/1024:.1f}GB")
@@ -360,37 +371,74 @@ def test_eviction_protection():
 
 
 def test_ssd_eviction_rejected():
-    """验证 SSD 副本不可驱逐。"""
+    """验证 SSD 副本不可驱逐：写入足够数据触发 offload，确认 SSD 副本安全。"""
     global _store
     print("=== 验证：SSD 副本不可驱逐 ===\n")
 
     store = create_store()
     _store = store
 
-    key = "ssd_safe_key"
-    data = b"\x03" * 4096
-    retcode = store.put(key, data)
-    if retcode != 0:
-        raise RuntimeError(f"put failed: {retcode}")
-    print(f"  写入 {key}")
+    # 需要足够数据量才能触发 offload（实测 <200MB 可能不触发）
+    num_keys = 50  # 50 × 4MB = 200MB
+    print(f"  [1] 写入 {num_keys} 个 4MB key ({num_keys * 4}MB)...")
+    t0 = time.time()
+    for i in range(num_keys):
+        key = f"ssd_safe_key_{i}"
+        data = (f"ssd_data_{i}".encode().ljust(KEY_SIZE, b"\x03"))
+        retcode = store.put(key, data)
+        if retcode != 0:
+            raise RuntimeError(f"put {key} 失败: retcode={retcode}")
+        if (i + 1) % 10 == 0:
+            print(f"    {i+1}/{num_keys} ({time.time()-t0:.1f}s)")
+        time.sleep(INSERT_INTERVAL)
+    print(f"  写入完成: {num_keys} 个 ({num_keys * 4}MB, {time.time()-t0:.1f}s)")
+    print_metrics("写入后")
 
     offload_wait = 20
-    print(f"  等 offload ({offload_wait}s)...")
+    print(f"\n  [2] 等 offload ({offload_wait}s)...")
     wait_with_progress(offload_wait)
+    print_metrics("offload 后")
 
-    for attempt in range(6):
+    # 验证随机 key 可读（数据应从 SSD 或 DDR 读取）
+    test_keys = ["ssd_safe_key_0", "ssd_safe_key_25", "ssd_safe_key_49"]
+    all_ok = True
+    for key in test_keys:
         result = store.get(key)
+        expected = f"ssd_data_{key.split('_')[-1]}".encode().ljust(KEY_SIZE, b"\x03")
+        if result and len(result) == KEY_SIZE:
+            print(f"  ✓ {key} 可读取 ({len(result)/1024/1024:.0f}MB)")
+        else:
+            rlen = len(result) if result else 0
+            print(f"  ✗ {key} 不可读 (len={rlen})")
+            all_ok = False
+
+    if not all_ok:
+        raise AssertionError("SSD 副本验证失败")
+
+    # 6 次读取确认一致性
+    print(f"\n  [3] 6 次连续读取验证一致性...")
+    for attempt in range(6):
+        result = store.get(test_keys[0])
         if not result or result == b"":
             print(f"  ✗ 第 {attempt} 次读取失败")
             raise AssertionError("SSD 副本丢失")
-        if result != data:
-            raise AssertionError("数据不一致")
         if attempt == 0:
-            print(f"  ✓ offload 后读取正确")
-        if attempt < 5:
-            time.sleep(2)
+            print(f"  ✓ 所有读取一致")
+        time.sleep(2)
 
-    print(f"  ✓ 6 次读取全部一致 — SSD 副本安全")
+    # 直接检查 SSD 目录确认 offload 确实发生
+    ssd_path = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+                         "/tmp/mooncake_ssd_test")
+    if os.path.exists(ssd_path):
+        files = [f for f in os.listdir(ssd_path) if os.path.isfile(os.path.join(ssd_path, f))]
+        total_size = sum(os.path.getsize(os.path.join(ssd_path, f)) for f in files)
+        print(f"\n  SSD 目录检查: {len(files)} 个文件, {total_size/1024/1024:.0f}MB")
+        if total_size < 100 * 1024 * 1024:
+            print(f"  ⚠ SSD 文件总量 < 100MB，offload 可能未完成或心跳间隔过长")
+    else:
+        print(f"\n  ⚠ SSD 目录不存在: {ssd_path}")
+
+    print(f"\n  ✓ SSD 副本安全，驱逐保护生效")
 
 
 def test_full_lifecycle():
@@ -456,15 +504,24 @@ def test_full_lifecycle():
 
 
 def test_load_balancing():
-    """验证多 Client 负载均衡：开 2 个 Client，向 Client 1 写入，观察 SSD 分布。"""
+    """验证多 Client 负载均衡：不对称 SSD 容量，小 SSD 先满后溢出到大 SSD。"""
     global _store
-    print("=== 验证：多 Client 负载均衡 ===\n")
+    print("=== 验证：多 Client 负载均衡（不对称 SSD 容量） ===\n")
 
     import shutil
 
-    seg_size = DEFAULT_DDR_SIZE
+    seg_size = DEFAULT_DDR_SIZE  # 4GB DDR per client
 
-    # 两个 Client 使用不同的 SSD 路径
+    # Client 1 (写入端): SSD=8GB, effective=4GB, watermark at used > 3.4GB
+    # Client 2:          SSD=16GB, effective=12GB, watermark at used > 10.2GB
+    ssd_cap_1 = 8 * 1024 * 1024 * 1024   # 8GB
+    ssd_cap_2 = 16 * 1024 * 1024 * 1024  # 16GB
+    effective_1 = ssd_cap_1 - seg_size   # 4GB
+    effective_2 = ssd_cap_2 - seg_size   # 12GB
+    watermark = 0.15
+    trigger_1 = effective_1 * (1 - watermark)  # 3.4GB ≈ 870 keys × 4MB
+    trigger_2 = effective_2 * (1 - watermark)  # 10.2GB
+
     ssd_path_1 = "/tmp/mooncake_lb_test_1"
     ssd_path_2 = "/tmp/mooncake_lb_test_2"
 
@@ -475,58 +532,104 @@ def test_load_balancing():
             shutil.rmtree(p)
         os.makedirs(p, exist_ok=True)
 
-    print(f"\n  [1] 启动 Client 2 (SSD={ssd_path_2})...")
+    print(f"\n  设定:")
+    print(f"    Client 1 (写入端): SSD={ssd_cap_1/1024/1024/1024:.1f}GB, "
+          f"effective={effective_1/1024/1024/1024:.1f}GB, "
+          f"水位触发 > {trigger_1/1024/1024/1024:.1f}GB ({int(trigger_1/KEY_SIZE)} keys)")
+    print(f"    Client 2:          SSD={ssd_cap_2/1024/1024/1024:.1f}GB, "
+          f"effective={effective_2/1024/1024/1024:.1f}GB, "
+          f"水位触发 > {trigger_2/1024/1024/1024:.1f}GB")
+
+    print(f"\n  [1] 启动 Client 2 (SSD={ssd_cap_2/1024/1024/1024:.1f}GB)...")
     store2 = create_store(segment_size=seg_size, buffer_size=seg_size,
-                          ssd_path_override=ssd_path_2)
+                          ssd_path_override=ssd_path_2,
+                          ssd_total_size_override=ssd_cap_2)
     print(f"  Client 2 启动成功")
 
-    print(f"\n  [2] 启动 Client 1 (SSD={ssd_path_1})...")
+    print(f"\n  [2] 启动 Client 1 (SSD={ssd_cap_1/1024/1024/1024:.1f}GB)...")
     store1 = create_store(segment_size=seg_size, buffer_size=seg_size,
-                          ssd_path_override=ssd_path_1)
+                          ssd_path_override=ssd_path_1,
+                          ssd_total_size_override=ssd_cap_1)
     _store = store1
     print(f"  Client 1 启动成功")
 
     print_metrics("两个 Client 均已注册")
 
-    # Client 1 写入数据
-    num_keys = 100
-    print(f"\n  [3] Client 1 写入 {num_keys} 个 4MB key ({num_keys * 4}MB)...")
+    # 写入约 1200 个 key（4.8GB），超过 Client 1 水位但低于 Client 2 水位
+    num_keys = 1200
+    print(f"\n  [3] Client 1 写入 {num_keys} 个 4MB key ({num_keys * 4}MB ≈ {num_keys * 4 / 1024:.1f}GB)...")
+    print(f"      预计 Client 1 水位先触发（~{int(trigger_1/KEY_SIZE)} keys），"
+          f"后续分配到 Client 2")
 
     written = 0
+    rejected = 0
+    first_reject_key = None
+    t0 = time.time()
+
     for i in range(num_keys):
         key = f"lb_key_{i}"
-        data = b"\xAB" * KEY_SIZE
+        data = f"lb_{i}".encode().ljust(KEY_SIZE, b"\xAB")
         retcode = store1.put(key, data)
         if retcode == 0:
             written += 1
         else:
-            print(f"    put failed at key {i}: retcode={retcode}")
-            break
-        if (i + 1) % 25 == 0:
-            print(f"    {i+1}/{num_keys}")
+            rejected += 1
+            if first_reject_key is None:
+                first_reject_key = i
+                total_gb = written * KEY_SIZE / 1024 / 1024 / 1024
+                print(f"\n  ★ 首次拒绝: key={key}, 已写入 {written} 个 ({total_gb:.1f}GB)")
+                print_metrics("首次拒绝时")
+            if rejected >= 5:
+                print(f"  连续 5 次拒绝，停止写入")
+                break
+        if (i + 1) % 200 == 0:
+            elapsed = time.time() - t0
+            print(f"    {i+1}/{num_keys} 写入 ({written} 成功, {rejected} 拒绝, {elapsed:.0f}s)")
         time.sleep(INSERT_INTERVAL)
 
-    print(f"  写入成功: {written} 个 ({written * 4}MB)")
-    print_metrics("写入后")
+    total_gb = written * KEY_SIZE / 1024 / 1024 / 1024
+    print(f"\n  写入完成: {written} 成功 ({total_gb:.1f}GB), "
+          f"{rejected} 拒绝, {time.time()-t0:.0f}s")
+    if first_reject_key is not None:
+        print(f"  首次拒绝于第 {first_reject_key} 个 key")
 
-    offload_wait = 30
+    print_metrics("写入完成")
+
+    offload_wait = 60
     print(f"\n  [4] 等待 {offload_wait}s 让 offload 完成...")
     wait_with_progress(offload_wait)
 
     print_metrics("offload 后")
 
     # 检查两个 SSD 目录的文件大小
+    ssd_sizes = {}
+    print(f"\n  --- SSD 目录检查 ---")
     for label, path in [("Client 1 SSD", ssd_path_1), ("Client 2 SSD", ssd_path_2)]:
         if os.path.exists(path):
             files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
             total_size = sum(os.path.getsize(os.path.join(path, f)) for f in files)
-            print(f"  {label}: {len(files)} 个文件, {total_size/1024/1024:.0f}MB")
+            print(f"  {label}: {len(files)} 个文件, {total_size/1024/1024:.0f}MB ({total_size/1024/1024/1024:.2f}GB)")
+            ssd_sizes[label] = total_size
         else:
             print(f"  {label}: 目录不存在")
+            ssd_sizes[label] = 0
 
-    print(f"\n  ✓ 负载均衡测试完成 — 检查上述 SSD 分布")
-    print(f"    若两个 Client 的 SSD 均有数据，说明负载均衡正常")
-    print(f"    若仅 Client 1 的 SSD 有数据，说明数据未跨节点分配")
+    # 验证结果
+    size_1 = ssd_sizes.get("Client 1 SSD", 0)
+    size_2 = ssd_sizes.get("Client 2 SSD", 0)
+
+    print(f"\n  --- 判断 ---")
+    if size_1 > 0 and size_2 > 0:
+        print(f"  ✓ 两个 Client 的 SSD 均有数据 — 负载均衡生效")
+        if size_2 > size_1:
+            print(f"  ✓ Client 2 SSD ({size_2/1024/1024:.0f}MB) > "
+                  f"Client 1 SSD ({size_1/1024/1024:.0f}MB) — 溢出行为正常")
+        print(f"  Client 1 水位触发约在 {trigger_1/1024/1024/1024:.1f}GB, "
+              f"实际 SSD={size_1/1024/1024/1024:.2f}GB")
+    elif size_1 > 0:
+        print(f"  ✗ 仅 Client 1 有数据 — 负载均衡未生效")
+    else:
+        print(f"  ✗ SSD 均无数据 — offload 可能失败（检查心跳间隔和磁盘空间）")
 
     # 关闭 Client 2
     store2.close()

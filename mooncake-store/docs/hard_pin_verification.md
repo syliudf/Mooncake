@@ -39,7 +39,7 @@ DDR=4GB, SSD=16GB, Key=4MB
 - **SSD 显示 infinity 的原因**：如果未设置 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`，默认为 2TB，表现为 "infinity"。脚本会检查此环境变量，未设置时报错退出。
 - **put() 不抛异常**：`store.put()` 返回整数状态码（0=成功, 非0=失败），不会抛异常。
 - **进程会等待退出**：脚本结束时打印 `>>> 按回车退出`，方便查看 Master 日志后再退出。
-- **offload 需要足够数据量**：实测发现 offload 在写入量较小时可能不触发，脚本已设计为写入足够多的数据（≥200MB）。
+- **offload 触发条件**：offload 无数据量阈值——只要 key 进入 `offloading_objects` 且心跳触发即可。如 SSD 始终为 0，检查 `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` 是否设为 1（默认为 10s）。
 - **每次插入间等 0.01s**：避免写入过快导致问题。
 - **Duplicate Key 警告**：如果出现 `Duplicate key detected in BatchOffload` 警告，说明 offload 管线存在跨 bucket 重复提交问题（`GroupOffloadingKeysByBucket` 中 `ungrouped_offloading_objects_` 与当前 `offloading_objects` 的跨 bucket 去重缺失），已在 `hard-pin` 分支修复。正常情况下不应再出现此警告。
 
@@ -131,6 +131,13 @@ Master 回显中搜索：
 
 此测试使用最小 DDR（16MB）并**关闭 SSD offload**，确保 `protected_key` 不会获得 LOCAL_DISK 副本，快速触发驱逐保护。
 
+### 默认规模
+
+DDR=16MB, SSD offload=关闭
+- protected_key: 100KB
+- filler key: 2MB × 7 个 ≈ 14MB（填满 16MB DDR）
+- 无 offload → 所有 key 仅 MEMORY 副本，HardPin 必须保护它们不被驱逐
+
 **Terminal 1** — 启动 Master：
 
 ```bash
@@ -154,13 +161,26 @@ python mooncake-wheel/tests/verify_hard_pin.py --test eviction_protection
 
 ### 预期观察
 
-- `protected_key`（没有 LOCAL_DISK 副本）**不被驱逐**
-- DDR 写满后新写入失败
+- 写入 `protected_key`（100KB），等待 lease 过期（500ms）
+- 用 2MB filler key 填满 16MB DDR（约 7~8 个）
+- `protected_key`（没有 LOCAL_DISK 副本）**仍可读** — 驱逐保护生效
+- 后续写入失败（DDR 满）
 - Master 日志：`[HARD_PIN] Memory eviction skipped: no LOCAL_DISK replica`
+- Master **不应** 循环打印 EVICT-TRIGGER/EVICT-DONE（已修复）
 
 ---
 
-## 验证 3：SSD 驱逐被拒绝
+## 验证 3：SSD 副本安全（offload 后数据可读）
+
+此测试写入 200MB 数据触发 offload，确认 LOCAL_DISK 副本写入正确且持续可读。
+（HardPin 模式下 `BatchEvictDiskReplica(LOCAL_DISK)` 无条件拒绝，LOCAL_DISK 不会被驱逐。）
+
+### 默认规模
+
+DDR=4GB, SSD=16GB, Key=4MB
+- 写入 50 个 key（200MB），等待 20s offload
+- offload 完成后验证所有 key 可读
+- 6 次连续读取确认数据一致性
 
 **Terminal 1** — 启动 Master：
 
@@ -185,10 +205,20 @@ MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/mooncake_hardpin_ssd_test \
 python mooncake-wheel/tests/verify_hard_pin.py --test ssd_eviction_rejected
 ```
 
+### 关键环境变量
+
+| 变量 | 值 | 说明 |
+|------|----|------|
+| `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `17179869184` | SSD 容量 16GB |
+| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `1` | **必须设为 1**，默认 10s 会导致 offload 延迟 |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/tmp/mooncake_hardpin_ssd_test` | SSD 存储目录（自动创建） |
+
 ### 预期观察
 
-- 写入 + offload 完成后数据可读取
-- 6 次读取全部一致，SSD 副本安全
+- 50 个 key 写入成功
+- 等待 20s 后 SSD 目录出现文件（≥100MB）
+- 随机 key 可读取（从 SSD 或 DDR）
+- 6 次连续读取全部一致，SSD 副本安全
 
 ---
 
@@ -227,9 +257,21 @@ python mooncake-wheel/tests/verify_hard_pin.py --test full_lifecycle
 
 ---
 
-## 验证 5：多 Client 负载均衡
+## 验证 5：多 Client 负载均衡（不对称 SSD 容量 + 溢出测试）
 
-本地启动 2 个 Client 进程，向其中一个写入，观察 SSD 数据是否跨节点分布。
+两个 Client 使用**不同的 SSD 容量**：
+- Client 1（写入端）：DDR=4GB, SSD=**8GB** → effective=4GB, 水位触发于 used > 3.4GB
+- Client 2：DDR=4GB, SSD=**16GB** → effective=12GB, 水位触发于 used > 10.2GB
+
+Client 1 写入约 1200 个 4MB key（4.8GB），超过 Client 1 水位（3.4GB）后，**后续分配自动溢出到 Client 2**。
+
+### 默认规模
+
+DDR=4GB×2, SSD=8GB+16GB, Key=4MB
+- effective: Client 1=4GB, Client 2=12GB
+- Client 1 水位触发: written > 3.4GB (~870 keys)
+- Client 2 水位触发: written > 10.2GB (~2610 keys)
+- 脚本自动管理 SSD 容量（无需设置 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`）
 
 **Terminal 1** — 启动 Master：
 
@@ -248,22 +290,22 @@ mooncake_master \
 
 ```bash
 MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
-MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=17179869184 \
 MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
 python mooncake-wheel/tests/verify_hard_pin.py --test load_balancing
 ```
 
 ### 预期观察
 
-- 脚本自动创建两个 Client，使用不同的 SSD 路径
-- Client 1 写入数据后，等待 30s offload
-- 检查两个 SSD 目录：**两者均应有数据文件**
-- 若仅 Client 1 的 SSD 有数据，说明负载均衡未生效
+- Client 2 (SSD=16GB) 先注册，Client 1 (SSD=8GB) 后注册
+- Client 1 写入约 1200 个 key，写入过程中可能出现拒绝（Client 1 SSD 水位触发）
+- 等待 60s offload 后，两个 SSD 目录均有文件
+- **Client 2 的 SSD 数据量 > Client 1**（溢出行为正常）
 
 ### 判断标准
 
-- Master 日志中两个 segment 的 SSD 使用量均应 > 0
-- 脚本输出中两个 SSD 目录的文件大小均应 > 0
+- 两个 SSD 目录文件大小均 > 0
+- Client 2 SSD > Client 1 SSD（溢出）
+- Client 1 水位触发日志 `Refusing allocation to guarantee data safety` 出现
 
 ---
 

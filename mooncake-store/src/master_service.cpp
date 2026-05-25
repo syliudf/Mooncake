@@ -4039,10 +4039,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
     } else {
-        if (object_count == 0) {
-            // No objects to evict, no need to check again
-            need_eviction_ = false;
-        }
+        // Always clear need_eviction_ after an eviction attempt, even when
+        // no objects could be evicted (e.g. HardPin protection skipped all
+        // candidates).  Otherwise the eviction thread spins every 10 ms
+        // forever without making progress.  If DDR pressure persists,
+        // subsequent PutStart failures will re-set the flag.
+        need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_fail();
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
