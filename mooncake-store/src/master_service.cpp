@@ -2273,9 +2273,11 @@ double MasterService::GetSsdFreeRatioForSegment(
     int64_t pending = 0;
     for (const auto& [k, sz] : ld->offloading_objects) pending += sz;
     int64_t used = ld->ssd_used_bytes + pending;
-    // Reserve DDR-sized space on SSD so all DDR data can always be offloaded.
+    // Reserve per-segment DDR-sized space on SSD so all DDR data
+    // for this segment can always be offloaded.
     int64_t ddr_total =
-        MasterMetricManager::instance().get_total_mem_capacity();
+        MasterMetricManager::instance().get_segment_total_mem_capacity(
+            segment_name);
     int64_t effective_capacity =
         ld->ssd_total_capacity_bytes - ddr_total;
     if (effective_capacity <= 0) return 0.0;

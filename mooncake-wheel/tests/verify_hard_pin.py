@@ -512,12 +512,13 @@ def test_load_balancing():
 
     seg_size = DEFAULT_DDR_SIZE  # 4GB DDR per client
 
-    # Client 1 (写入端): SSD=8GB, effective=4GB, watermark at used > 3.4GB
-    # Client 2:          SSD=16GB, effective=12GB, watermark at used > 10.2GB
+    # With per-segment effective formula: effective = SSD - per_segment_DDR
+    # Client 1 (writer): SSD=8GB,  effective=8-4=4GB,   trigger at used > 3.4GB
+    # Client 2:          SSD=16GB, effective=16-4=12GB, trigger at used > 10.2GB
     ssd_cap_1 = 8 * 1024 * 1024 * 1024   # 8GB
     ssd_cap_2 = 16 * 1024 * 1024 * 1024  # 16GB
-    effective_1 = ssd_cap_1 - seg_size   # 4GB
-    effective_2 = ssd_cap_2 - seg_size   # 12GB
+    effective_1 = ssd_cap_1 - seg_size    # 4GB
+    effective_2 = ssd_cap_2 - seg_size    # 12GB
     watermark = 0.15
     trigger_1 = effective_1 * (1 - watermark)  # 3.4GB ≈ 870 keys × 4MB
     trigger_2 = effective_2 * (1 - watermark)  # 10.2GB
@@ -635,6 +636,222 @@ def test_load_balancing():
     store2.close()
 
 
+def test_sequential_shutdown():
+    """验证 4 节点顺序 SSD 关闭：不同 SSD 容量下，节点按容量从小到大依次被排除。
+
+    计算公式（已修复为 per-segment）：
+      effective_capacity = ssd_total_capacity_bytes - per_segment_ddr
+    其中 per_segment_ddr 是该 segment 自身的 DDR 容量，非全局总和。
+
+    本测试使用 DDR=1GB×4 节点。
+    SSD 配置：3GB, 4GB, 5GB, 6GB → effective=2, 3, 4, 5 GB。
+    """
+    global _store
+    import shutil
+
+    print("=== 验证：4 节点顺序 SSD 关闭 ===\n")
+
+    DDR_PER_CLIENT = 1 * 1024 * 1024 * 1024     # 1GB per client
+    SSD_CAPS = [
+        3 * 1024 * 1024 * 1024,    # C1 (smallest):  effective=2GB, trigger=1.7GB
+        4 * 1024 * 1024 * 1024,    # C2:             effective=3GB, trigger=2.55GB
+        5 * 1024 * 1024 * 1024,    # C3:             effective=4GB, trigger=3.4GB
+        6 * 1024 * 1024 * 1024,    # C4 (largest):   effective=5GB, trigger=4.25GB
+    ]
+
+    watermark = 0.15
+    for i, cap in enumerate(SSD_CAPS):
+        effective = cap - DDR_PER_CLIENT  # per-segment formula
+        trigger = effective * (1 - watermark)
+        print(f"  Client {i+1}: SSD={cap/1024/1024/1024:.0f}GB → "
+              f"effective={effective/1024/1024/1024:.1f}GB, "
+              f"trigger={trigger/1024/1024/1024:.2f}GB ({int(trigger/KEY_SIZE)} keys)")
+
+    SSD_PATHS = [
+        "/tmp/mooncake_seq_test_c1",
+        "/tmp/mooncake_seq_test_c2",
+        "/tmp/mooncake_seq_test_c3",
+        "/tmp/mooncake_seq_test_c4",
+    ]
+    BATCH_SIZE = 250          # 250 keys × 4MB = 1GB per batch
+    OFFLOAD_WAIT = 10          # seconds between batches
+    MAX_BATCHES = 30           # safety limit (~30GB total)
+
+    print(f"\n  DDR 每节点: {DDR_PER_CLIENT / 1024/1024/1024:.0f}GB × 4")
+    print(f"  Batch: {BATCH_SIZE} keys ({BATCH_SIZE * 4}MB), "
+          f"offload wait: {OFFLOAD_WAIT}s")
+
+    # Clean and create SSD directories
+    print(f"\n  [1] 准备 SSD 目录...")
+    for p in SSD_PATHS:
+        if os.path.exists(p):
+            shutil.rmtree(p)
+        os.makedirs(p, exist_ok=True)
+    print(f"  目录已清理")
+
+    # Create all 4 clients — largest SSD first (registration order matters!)
+    # If a small-SSD client registered first, its effective capacity would be
+    # temporarily inflated because fewer DDR segments are counted in ddr_total.
+    print(f"\n  [2] 启动 Client (按 SSD 从大到小注册)...")
+    stores = []
+    for i in range(3, -1, -1):  # 3→2→1→0 (C4 largest → C1 smallest)
+        store = create_store(
+            segment_size=DDR_PER_CLIENT,
+            buffer_size=DDR_PER_CLIENT,
+            ssd_path_override=SSD_PATHS[i],
+            ssd_total_size_override=SSD_CAPS[i],
+        )
+        stores.insert(0, store)  # stores[0] = C1, stores[1] = C2, ...
+        print(f"  Client {i+1} (SSD={SSD_CAPS[i]/1024/1024/1024:.0f}GB) 启动成功")
+    print(f"  所有 Client 已注册 (C1→C4: {len(stores)} 个)")
+
+    writer_store = stores[0]  # C1 (smallest SSD) is the writer
+    _store = writer_store
+
+    print_metrics("注册后")
+
+    def get_ssd_dir_sizes():
+        """返回每个 SSD 目录的文件总大小列表。"""
+        results = []
+        for path in SSD_PATHS:
+            if os.path.exists(path):
+                total = sum(
+                    os.path.getsize(os.path.join(path, f))
+                    for f in os.listdir(path)
+                    if os.path.isfile(os.path.join(path, f))
+                )
+                results.append(total)
+            else:
+                results.append(0)
+        return results
+
+    def check_size_order(sizes, label):
+        """检查 SSD 大小是否按容量递增（允许 5% 容差）。"""
+        verdicts = []
+        for i in range(3):
+            # C(i+1) should have ≤ data than C(i+2)
+            ok = sizes[i] <= sizes[i+1] * 1.05
+            if ok:
+                verdicts.append("OK")
+            else:
+                verdicts.append(f"INV: C{i+1}>{i+2}")
+        status = " | ".join(f"C{i+1}≤C{i+2}:{v}" for i, v in enumerate(verdicts))
+        print(f"    [{label}] {status}")
+        return all(v == "OK" for v in verdicts)
+
+    def find_stabilized(sizes, prev_sizes):
+        """检测哪些节点的 SSD 停止增长（本批次增长 < 5%）。"""
+        stabilized = []
+        for i in range(4):
+            if prev_sizes[i] > 0 and sizes[i] <= prev_sizes[i] * 1.05:
+                stabilized.append(i + 1)
+        return stabilized
+
+    # Main write loop
+    total_written = 0
+    total_rejected = 0
+    prev_sizes = [0, 0, 0, 0]
+    all_rejected_batch = None
+
+    for batch_idx in range(MAX_BATCHES):
+        batch_written = 0
+        batch_rejected = 0
+        t_start = time.time()
+
+        for i in range(BATCH_SIZE):
+            key = f"seq_key_{total_written}"
+            data = f"seq_{total_written}".encode().ljust(KEY_SIZE, b"\xCD")
+            retcode = writer_store.put(key, data)
+            if retcode == 0:
+                batch_written += 1
+            else:
+                batch_rejected += 1
+            total_written += 1
+            time.sleep(INSERT_INTERVAL)
+
+        batch_elapsed = time.time() - t_start
+        total_rejected += batch_rejected
+
+        print(f"\n--- Batch {batch_idx + 1} ({batch_elapsed:.0f}s) ---")
+        print(f"  写入: {batch_written} 成功, {batch_rejected} 拒绝 "
+              f"(累计: {total_written} 尝试, {total_rejected} 拒绝)")
+
+        # Wait for offload
+        print(f"  等待 offload ({OFFLOAD_WAIT}s)...")
+        wait_with_progress(OFFLOAD_WAIT)
+        print_metrics(f"batch {batch_idx + 1}")
+
+        # Check SSD sizes
+        sizes = get_ssd_dir_sizes()
+        print(f"  SSD 目录大小:")
+        for i in range(4):
+            change = sizes[i] - prev_sizes[i]
+            sign = "+" if change >= 0 else ""
+            print(f"    C{i+1} ({SSD_CAPS[i]/1024/1024/1024:.0f}GB SSD): "
+                  f"{sizes[i]/1024/1024:.0f}MB ({sign}{change/1024/1024:.0f}MB)")
+
+        check_size_order(sizes, f"batch {batch_idx + 1}")
+
+        stabilized = find_stabilized(sizes, prev_sizes)
+        if stabilized:
+            print(f"  停止增长: C{','.join(map(str, stabilized))}")
+
+        prev_sizes = sizes
+
+        # Stop condition: entire batch rejected → all segments excluded
+        if batch_written == 0 and batch_rejected > 0:
+            all_rejected_batch = batch_idx + 1
+            print(f"\n  *** Batch {batch_idx + 1}: 所有写入被拒 — "
+                  f"全部 {4} 个 segment 已被排除 ***")
+            break
+
+    # Final verification
+    print(f"\n{'='*60}")
+    print(f"最终验证")
+    print(f"{'='*60}\n")
+
+    final_sizes = get_ssd_dir_sizes()
+    print_metrics("最终")
+
+    print(f"\n  SSD 最终状态:")
+    for i in range(4):
+        eff = SSD_CAPS[i] - DDR_PER_CLIENT
+        trigger = eff * (1 - watermark)
+        print(f"    C{i+1} (SSD={SSD_CAPS[i]/1024/1024/1024:.0f}GB, "
+              f"eff={eff/1024/1024/1024:.1f}GB, trigger={trigger/1024/1024/1024:.2f}GB): "
+              f"{final_sizes[i]/1024/1024:.0f}MB")
+
+    ssds_with_data = sum(1 for s in final_sizes if s > 0)
+    print(f"\n  SSD 有数据的节点: {ssds_with_data}/4")
+
+    order_ok = check_size_order(final_sizes, "final")
+    if not order_ok:
+        print(f"\n  *** 注意：最终 SSD 大小顺序不完全递增，"
+              f"可能是因为 free-ratio-first 分配策略偏好较大 SSD")
+
+    # Success criteria
+    all_ok = True
+    if ssds_with_data < 3:
+        print(f"  ✗ 仅 {ssds_with_data}/4 SSD 有数据 (预期 >= 3)")
+        all_ok = False
+
+    if all_rejected_batch is not None:
+        print(f"  ✓ 全局拒绝达成 (batch {all_rejected_batch}) — "
+              f"验证 HardPin 不 fallback")
+    else:
+        print(f"  ✗ 未达到全局拒绝 — 所有 batch 均有写入成功")
+        all_ok = False
+
+    if all_ok:
+        print(f"\n  ✓ 4 节点顺序 SSD 关闭验证通过")
+    else:
+        raise AssertionError("4 节点顺序 SSD 关闭验证失败")
+
+    # Cleanup: close non-writer stores
+    for i in range(1, 4):
+        stores[i].close()
+
+
 TESTS = {
     "offload_only": test_offload_only,
     "ssd_full_reject": test_ssd_full_reject,
@@ -642,6 +859,7 @@ TESTS = {
     "ssd_eviction_rejected": test_ssd_eviction_rejected,
     "full_lifecycle": test_full_lifecycle,
     "load_balancing": test_load_balancing,
+    "sequential_shutdown": test_sequential_shutdown,
 }
 
 

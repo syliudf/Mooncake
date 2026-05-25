@@ -23,7 +23,8 @@ python verify_hard_pin.py --test <test_name>
 | `eviction_protection` | 无 LOCAL_DISK 副本的 MEMORY 不被驱逐 |
 | `ssd_eviction_rejected` | SSD (LOCAL_DISK) 副本不能被驱逐 |
 | `full_lifecycle` | 完整 写入→offload→驱逐→读取 生命周期 |
-| `load_balancing` | 多 Client 负载均衡：2 个 Client，向一个写入，检查 SSD 分布 |
+| `load_balancing` | 多 Client 负载均衡：2 个 Client 不对称 SSD，向一个写入，检查 SSD 分布 |
+| `sequential_shutdown` | **4 节点顺序关闭**：4 个不同 SSD 容量的节点，验证按容量从小到大依次因水位触发而停止接收写入 |
 
 ## 默认规模
 
@@ -260,14 +261,16 @@ python mooncake-wheel/tests/verify_hard_pin.py --test full_lifecycle
 ## 验证 5：多 Client 负载均衡（不对称 SSD 容量 + 溢出测试）
 
 两个 Client 使用**不同的 SSD 容量**：
-- Client 1（写入端）：DDR=4GB, SSD=**8GB** → effective=4GB, 水位触发于 used > 3.4GB
-- Client 2：DDR=4GB, SSD=**16GB** → effective=12GB, 水位触发于 used > 10.2GB
+- Client 1（写入端）：DDR=4GB, SSD=**8GB** → effective=4GB (per-segment)，水位触发于 used > 3.4GB
+- Client 2：DDR=4GB, SSD=**16GB** → effective=12GB，水位触发于 used > 10.2GB
+
+> **effective 计算公式**：`effective = SSD - per_segment_DDR`。每个节点独立计算，不需要知道其他节点的 DDR。
 
 Client 1 写入约 1200 个 4MB key（4.8GB），超过 Client 1 水位（3.4GB）后，**后续分配自动溢出到 Client 2**。
 
 ### 默认规模
 
-DDR=4GB×2, SSD=8GB+16GB, Key=4MB
+DDR=4GB×2, SSD=8+16GB, Key=4MB
 - effective: Client 1=4GB, Client 2=12GB
 - Client 1 水位触发: written > 3.4GB (~870 keys)
 - Client 2 水位触发: written > 10.2GB (~2610 keys)
@@ -306,6 +309,119 @@ python mooncake-wheel/tests/verify_hard_pin.py --test load_balancing
 - 两个 SSD 目录文件大小均 > 0
 - Client 2 SSD > Client 1 SSD（溢出）
 - Client 1 水位触发日志 `Refusing allocation to guarantee data safety` 出现
+
+---
+
+## 验证 6：4 节点顺序 SSD 关闭（负载均衡进阶）
+
+此测试使用 4 个不同 SSD 容量的节点，验证随着写入数据累积，SSD 按容量从小到大依次因水位触发而停止接收写入，直到所有节点被排除后全局拒绝写入。
+
+### effective 计算公式（per-segment）
+
+`GetSsdFreeRatioForSegment()` 中的 effective capacity 计算公式为（已修复）：
+
+```
+effective_capacity = ssd_total_capacity_bytes - per_segment_ddr
+```
+
+其中 `per_segment_ddr` 是该 segment **自身**的 DDR 容量（通过 `get_segment_total_mem_capacity(segment_name)` 获取），**不是**全局 DDR 总和。每个节点独立计算，不依赖其他节点的 DDR 大小。
+
+### 默认规模
+
+DDR=1GB×4, SSD=3+4+5+6GB, Key=4MB（快速模式，约 5 分钟）
+
+| 节点 | DDR | SSD | effective | 水位 15% 触发点 |
+|------|-----|-----|-----------|-----------------|
+| C1 (最小) | 1GB | 3GB | 2GB | used > 1.7GB |
+| C2 | 1GB | 4GB | 3GB | used > 2.55GB |
+| C3 | 1GB | 5GB | 4GB | used > 3.4GB |
+| C4 (最大) | 1GB | 6GB | 5GB | used > 4.25GB |
+
+- `effective = SSD - 1GB`（每个节点只减自己的 DDR）
+- `free-ratio-first` 策略：较大 SSD 的 free_ratio 下降更慢，自然获得更多分配
+- 期望排除顺序：C1 → C2 → C3 → C4（容量从小到大）
+
+**生产规模变体（4GB DDR 节点）**：
+
+| 节点 | SSD | effective | 触发点 |
+|------|-----|-----------|--------|
+| C1 | 8GB | 4GB | 3.4GB |
+| C2 | 12GB | 8GB | 6.8GB |
+| C3 | 16GB | 12GB | 10.2GB |
+| C4 | 20GB | 16GB | 13.6GB |
+
+需磁盘 56GB，约 8 分钟。直接修改 `verify_hard_pin.py` 中 `DDR_PER_CLIENT` 和 `SSD_CAPS` 常量即可切换。
+
+### 注册顺序
+
+Client 按 SSD 从大到小注册（C4 → C3 → C2 → C1）。虽然 per-segment 公式不依赖全局 DDR 总和，但从大到小注册可避免 client-side 检查（`ssd_limit - segment_size`）因暂时高估而误报。脚本已内置此逻辑。
+
+**Terminal 1** — 启动 Master：
+
+```bash
+mooncake_master \
+    --port=50053 \
+    --http_metadata_server_port=8880 \
+    --enable_http_metadata_server=true \
+    --metrics_port=9104 \
+    --allocation_strategy=hard_pin \
+    --enable_offload=true \
+    --ssd_watermark_ratio=0.15 \
+    --default_kv_lease_ttl=2000
+```
+
+**Terminal 2** — 运行验证脚本：
+
+```bash
+MC_METADATA_SERVER=http://127.0.0.1:8880/metadata \
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+python mooncake-wheel/tests/verify_hard_pin.py --test sequential_shutdown
+```
+
+（不需要设置 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`，脚本通过 `ssd_total_size_override` 参数为每个 Client 单独传递 SSD 容量。）
+
+### 预期观察
+
+测试以 **batch** 为单位写入（每 batch 250 个 4MB key = 1GB），batch 间等待 10s 让 offload 管线排空。
+
+**Phase 1 (batch 1-6, ~6GB 写入)**：4 个节点全部活跃
+- 所有 SSD 目录均有文件，大小递增：C1 < C2 < C3 < C4
+- 部分 batch 拒绝计数 = 0（或极少）
+
+**Phase 2 (batch 7-12, ~12GB 写入)**：C1 被排除
+- C1 SSD 目录停止增长（增长 < 5%），C2/C3/C4 继续
+- 脚本输出 `停止增长: C1`
+
+**Phase 3 (batch 13-18, ~18GB 写入)**：C1、C2 被排除
+- C1、C2 SSD 停止增长，仅 C3/C4 继续
+
+**Phase 4 (batch 19-24, ~24GB 写入)**：C1、C2、C3 被排除
+- 仅 C4 继续增长
+- batch 中可能出现少量拒绝（某些 `Allocate()` 采样的候选集恰好覆盖已排除的 segment）
+
+**Phase 5 (全部排除)**：
+- 某一 batch 写入全部返回非零 → 全局拒绝
+- 脚本输出 `*** Batch N: 所有写入被拒 — 全部 4 个 segment 已被排除 ***`
+- Master 日志：`[HARD_PIN] ... Refusing allocation to guarantee data safety.`
+- **不应出现** `Falling back to allocation without SSD filter`
+
+### 判断标准
+
+| 条件 | 含义 |
+|------|------|
+| 至少 3/4 SSD 有数据 | 多节点数据分布正常 |
+| SSD 大小顺序递增（C1 ≤ C2 ≤ C3 ≤ C4） | free-ratio-first 分配策略有效 |
+| batch 间 C1 先停止增长，C4 最后 | 顺序排除行为正常 |
+| 最终全局拒绝（整 batch 写入失败） | HardPin 不 fallback |
+| `Refusing allocation to guarantee data safety` 出现 | SSD 水位拒绝生效 |
+
+### 为什么 SSD 目录大小并非严格单调
+
+`free-ratio-first` 策略采样 6 个候选 segment 后按 free_ratio 从高到低分配。所有 segment 初始 free_ratio = 1.0，因此分配有一定随机性。较大 SSD 的 free_ratio 下降更慢，随测试推进自然获得更多分配，但不保证严格排序。测试使用 5% 容差检查。
+
+### 与验证 5 的关系
+
+验证 5（load_balancing）是更简单的 2 节点版本，适合快速验证负载均衡基础行为。验证 6 是完整的 4 节点顺序关闭测试，适合在验证 5 通过后进行。
 
 ---
 

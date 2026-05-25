@@ -342,16 +342,14 @@ TEST_F(HardPinIntegrationTest, AllSsdFull_RefusesNewWrites) {
         *service, "test_segment", kDefaultSegmentBase, seg_size);
 
     // 报告一个很小的 SSD 容量，使 effective_capacity 很小
-    // effective_capacity = ssd_total - ddr_total
-    // ddr_total 来自 MasterMetricManager 的 get_total_mem_capacity()
-    // 设 SSD = 4MB + 1KB，DDR 总量约 4MB
-    // → effective_capacity ≈ 1KB，水位线 15%
-    // → 只要写入 1 个 key（1KB），effective 空间就低于水位线
+    // effective_capacity = ssd_total - per_segment_ddr
+    // per_segment_ddr 来自 MasterMetricManager 的 get_segment_total_mem_capacity()
+    // 设 SSD = 4MB + 100KB，本 segment DDR = 4MB
+    // → effective_capacity = 100KB，水位线 15%
+    // → 只要写入 1 个 key（90KB），effective 空闲就低于水位线
     //
-    // 注意：实际上 ddr_total 是全局所有 segment 之和，
-    // 这里我们只挂一个 4MB segment，所以 ddr_total = 4MB
-    // 设 SSD = 4MB + 100KB → effective_capacity = 100KB
-    // 水位线 15% → 至少需要 15KB 空闲
+    // 水位线 15% → effective_free >= 15KB 才允许写入
+    // effective_free = 100KB - 90KB = 10KB < 15KB → 拒绝
     service->ReportSsdCapacity(ctx.client_id, 4 * MiB + 100 * 1024);
 
     // 写入一个 key 并完成 offload 以消耗 SSD 空间
