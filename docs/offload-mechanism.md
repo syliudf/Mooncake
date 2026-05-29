@@ -151,17 +151,17 @@ flowchart TD
 
 | 函数 | 行号 | 职责 |
 |------|------|------|
-| `EvictionThreadFunc()` | :3160 | 后台线程，监测内存水位，触发 `BatchEvict` |
-| `BatchEvict()` | :4466 | 核心淘汰逻辑，按 lease_timeout 选候选对象，内部定义 `try_evict_or_offload` lambda(:4515) 处理 offload/evict 分支 |
-| `OffloadObjectHeartbeat()` | :2618 | 客户端心跳入口，返回 `offloading_objects` 队列给客户端 |
-| `NotifyOffloadSuccess()` | :2705 | 处理客户端 offload 完成通知：释放 MEMORY 副本 refcnt，添加 LOCAL_DISK 副本 |
-| `PushOffloadingQueue()` | :2744 | 将 key 入 offload 队列，根据副本的 segment 名称定位目标客户端 |
-| `TryPushPromotionQueue()` | :2823 | Get 命中 LOCAL_DISK 时调用，经四重准入检查后将 key 加入 promotion 队列 |
-| `PromotionObjectHeartbeat()` | :2919 | 返回待 promotion 任务（每次心跳限 1 个） |
-| `PromotionAllocStart()` | :2948 | 为 promotion 分配 MEMORY 副本（PROCESSING 状态） |
-| `NotifyPromotionSuccess()` | :3041 | 确认 promotion 完成：标记 MEMORY 副本 COMPLETE，释放 LOCAL_DISK refcnt |
+| `EvictionThreadFunc()` | :3212 | 后台线程，监测内存水位，触发 `BatchEvict` |
+| `BatchEvict()` | :4519 | 核心淘汰逻辑，按 lease_timeout 选候选对象，内部定义 `try_evict_or_offload` lambda(:4567) 处理 offload/evict 分支 |
+| `OffloadObjectHeartbeat()` | :2654 | 客户端心跳入口，返回 `offloading_objects` 队列给客户端 |
+| `NotifyOffloadSuccess()` | :2741 | 处理客户端 offload 完成通知：释放 MEMORY 副本 refcnt，添加 LOCAL_DISK 副本 |
+| `PushOffloadingQueue()` | :2797 | 将 key 入 offload 队列，根据副本的 segment 名称定位目标客户端 |
+| `TryPushPromotionQueue()` | :2876 | Get 命中 LOCAL_DISK 时调用，经四重准入检查后将 key 加入 promotion 队列 |
+| `PromotionObjectHeartbeat()` | :2972 | 返回待 promotion 任务（每次心跳限 1 个） |
+| `PromotionAllocStart()` | :3001 | 为 promotion 分配 MEMORY 副本（PROCESSING 状态） |
+| `NotifyPromotionSuccess()` | :3094 | 确认 promotion 完成：标记 MEMORY 副本 COMPLETE，释放 LOCAL_DISK refcnt |
 
-**PutEnd 中的 offload 触发**（:1390）：
+**PutEnd 中的 offload 触发**（:1399）：
 
 ```cpp
 if (enable_offload_ && !offload_on_evict_) {
@@ -174,7 +174,7 @@ if (enable_offload_ && !offload_on_evict_) {
 }
 ```
 
-**BatchEvict 中的 try_evict_or_offload**（:4515）：
+**BatchEvict 中的 try_evict_or_offload**（:4567）：
 
 ```cpp
 auto try_evict_or_offload = [&](const std::string& key, ObjectMetadata& metadata, ...) {
@@ -265,6 +265,15 @@ auto try_evict_or_offload = [&](const std::string& key, ObjectMetadata& metadata
 - **设大（如 0.10）**：每轮淘汰更多对象，eviction 频率更低但每轮耗时更长。
 - **设小（如 0.02）**：每轮淘汰少量对象，更平滑但 eviction 线程更频繁工作。
 
+#### 与 SSD Balance 策略的交互
+
+当 `--allocation_strategy=ssd_balance` 启用时，offload 行为受以下额外参数影响：
+
+- `--ssd_high_watermark_ratio`（默认 0.90）：segment 的 SSD 使用率超过此阈值后，`SsdBalanceAllocationStrategy` 不再向该 segment 分配新数据。已有 offload 数据不受影响。
+- `--ddr_admission_watermark_ratio`（默认 0.0，即禁用）：segment 的 DDR 使用率超过此阈值后，分配策略跳过该 segment。设为低于 `eviction_high_watermark_ratio` 的值时，准入拒绝先于 eviction 触发，保护 DDR 数据不被驱逐。
+
+`ssd_used_bytes` 在 `NotifyOffloadSuccess` 时递增、`EvictDiskReplica` 时递减（`master_service.cpp:2789, 1857`），供分配策略实时查询 SSD 使用率。
+
 ### 8.2 Client 端环境变量
 
 #### `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`（默认 `/data/file_storage`）
@@ -321,6 +330,24 @@ auto try_evict_or_offload = [&](const std::string& key, ObjectMetadata& metadata
 
 - **false**：使用标准 POSIX I/O（pread/pwrite）。
 - **true**：使用 Linux io_uring 异步 I/O。每个线程拥有独立的 io_uring ring（无锁），ClientBuffer 注册为 fixed buffer 避免 mmap 开销，配合 O_DIRECT 绕过页缓存。**仅 Linux 可用**。
+
+#### `MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION`（默认 false）
+
+- 强制禁止 SSD 存储后端的桶淘汰，即使 `eviction_policy` 设为 `fifo` 或 `lru` 也不驱逐。
+- **true**：`PrepareEviction()` 直接返回空结果（`storage_backend.cpp:2218`），保护已落盘数据不被删除。适用于数据不可丢失的场景。
+- **false**：正常遵循 `eviction_policy` 设置。
+
+#### `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT`（默认 10,000,000）
+
+- SSD 存储后端的 key 总数上限。配置定义在 `storage_backend.h:217`。
+- 达到上限后 `IsEnableOffloading()` 返回 false，阻止新 key 落盘。
+
+#### `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE`（默认 0，即不限）
+
+- BucketStorageBackend 的总容量上限（字节），独立于 `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`。
+- **设为 0**：不限制。
+- **设为正值**：总数据量超过此值时触发淘汰（如有 eviction policy）或阻止新 offload。
+- 可通过 `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` 作为 fallback 环境变量名。
 
 ### 8.3 内部硬编码常量
 

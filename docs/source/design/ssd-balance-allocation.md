@@ -85,6 +85,8 @@ ssd_free_ratio = (ssd_total_capacity - ssd_used_bytes) / ssd_total_capacity
     --ddr_admission_watermark_ratio=0.90
 ```
 
+**注意**：DDR 使用率指标通过 `MasterMetricManager` 异步采样（`get_segment_mem_used_ratio`），非实时。实际 DDR 使用率可能略高于设定水位线（如设 90% 实际到 93%），属预期行为。
+
 ## 4. 决策流程
 
 ### 4.1 AllocateAndInsertMetadata流程
@@ -205,7 +207,25 @@ class SsdMetricsProvider {
 |------|--------|------|
 | `MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION` | `false` | 强制禁止SSD驱逐，即使 eviction_policy 非 NONE 也不驱逐 |
 
-### 6.3 错误码
+### 6.3 Offload 准入与存储后端交互
+
+BucketStorageBackend 的 `IsEnableOffloading()` 方法（`storage_backend.cpp:1769-1791`）决定是否允许新 key 落盘：
+
+```
+IsEnableOffloading()
+│
+├── eviction_policy != NONE && !disable_ssd_eviction && max_total_size > 0?
+│   └── YES → 始终允许（PrepareEviction 会管理容量）
+│
+└── NO → 检查容量约束
+    └── total_size + bucket_size_limit <= total_size_limit?
+        ├── YES → 允许
+        └── NO → 返回 KEYS_ULTRA_LIMIT
+```
+
+当返回 `KEYS_ULTRA_LIMIT` 时，`file_storage.cpp:469-474` 将 `enable_offloading_` **永久设为 false**，后续所有心跳向 Master 发送 `enable_offloading=false`，Master 清空该客户端的 offload 队列。此行为不可逆，需重启客户端恢复。
+
+### 6.4 错误码
 
 | 错误码 | 值 | 触发条件 |
 |--------|-----|----------|
@@ -253,12 +273,12 @@ SsdMetricsProvider (抽象接口)
 
 ## 8. 验证方案
 
-详见 `mooncake-wheel/tests/verify_ssd_balance.py` 和 `tests/ssd_balance_test_guide.md`。
+详见 `mooncake-wheel/tests/verify_ssd_balance.py`（基础实现）、`tests/ssd_balance_verify.py`（扩展验证）和 `tests/ssd_balance_test_guide.md`（运行指南）。
 
 | 测试 | 验证内容 |
 |------|----------|
 | `load_balancing` | 2个Client不对称SSD，验证数据按SSD空闲比例分布 |
-| `ssd_high_watermark_blocking` | SSD达到90%高水位后offload完成，验证新分配被拒绝 + 初始数据可读 |
+| `ssd_high_watermark_blocking` | SSD达到90%高水位后offload完成，验证新分配被拒绝（`ssd_used_bytes` 异步更新，offload 完成后才反映真实水位）+ 初始数据可读 |
 | `ssd_eviction_protection` | 启用FIFO驱逐+`MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION=true`，验证已有SSD数据不被驱逐 |
 | `ddr_admission` | 设置 `--ddr_admission_watermark_ratio=0.90`，DDR满时拒绝写入，不触发eviction |
 | `all_ssd_full` | 所有节点SSD满后全局拒绝，释放后恢复 |
