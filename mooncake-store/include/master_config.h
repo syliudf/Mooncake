@@ -63,6 +63,10 @@ struct MasterConfig {
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
 
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
+
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
 
@@ -195,6 +199,11 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -276,6 +285,9 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        pod_name = config.pod_name;
+        pod_namespace = config.pod_namespace;
         validate();
     }
 
@@ -468,12 +480,15 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else if (config.allocation_strategy == "ssd_free_ratio_first") {
+            allocation_strategy_type =
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl "
-                            "(case-sensitive)";
+                         << "Valid options are: random, free_ratio_first, cxl, "
+                            "ssd_free_ratio_first (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
